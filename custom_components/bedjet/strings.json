@@ -1,8 +1,14 @@
 {
   "config": {
     "abort": {
+      "already_configured": "Device is already configured",
       "cannot_connect": "Failed to connect",
-      "no_devices_found": "No devices found on the network"
+      "no_devices_found": "No devices found on the network",
+      "unknown": "Unexpected error"
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "unknown": "Unexpected error"
     },
     "step": {
       "bluetooth_confirm": {
@@ -18,6 +24,9 @@
   },
   "entity": {
     "binary_sensor": {
+      "connection_test": {
+        "name": "Connection test"
+      },
       "dual_zone": {
         "name": "Dual zone"
       },
@@ -26,6 +35,12 @@
       }
     },
     "button": {
+      "acknowledge_notification": {
+        "name": "Acknowledge notification"
+      },
+      "firmware_update": {
+        "name": "Update firmware"
+      },
       "sync_clock": {
         "name": "Sync clock"
       }
@@ -53,8 +68,11 @@
           "bio_fail_too_long": "The specified sequence cannot be run because it contains steps that would be too long running from the current time"
         }
       },
-      "run_end_time": {
-        "name": "Run end time"
+      "outlet_temperature": {
+        "name": "Outlet temperature"
+      },
+      "scanner": {
+        "name": "Bluetooth scanner"
       },
       "shutdown_reason": {
         "name": "Shutdown reason"
@@ -63,14 +81,13 @@
         "name": "Turbo time"
       },
       "update_phase": {
-        "name": "Update phase",
-        "state": {
-          "24": "Connection test has completed OK",
-          "26": "Firmware update is not needed"
-        }
+        "name": "Update phase"
       }
     },
     "switch": {
+      "bluetooth_connection": {
+        "name": "Bluetooth connection"
+      },
       "enable_led": {
         "name": "Enable LED"
       },

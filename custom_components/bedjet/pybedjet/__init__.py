@@ -1,1022 +1,809 @@
-"""BedJet device module."""
+"""BedJet V3 async device client: connection lifecycle, watchdog, and command confirmation.
+
+See ``pybedjet/codec.py`` for the wire-protocol byte map (frame/tail decoding,
+command encoding) - that module is pure and has no I/O. This module owns only
+*when* to connect, read, write, and reconnect over a real BLE link shared
+through Home Assistant's ``bluetooth`` component (which may route through a
+remote ESPHome Bluetooth proxy) via ``bleak``/``bleak_retry_connector``.
+
+Single-slot connection model
+================================================================
+A BedJet V3 accepts exactly one BLE connection and stops advertising while
+connected (ground truth, verified live against a real unit). An advertisement
+is therefore a positive signal that the slot is currently free, and is what
+drives reconnection - see `_connect_supervisor`. `hold_connection` is the
+switch a user flips to voluntarily give the slot back to the BedJet mobile
+app without unloading the whole integration.
+
+16-bit CCCD note [answering the Contract's explicit question]: ESPHome's own
+`BedJetHub::write_notify_config_descriptor_` (bedjet_hub.cpp:420-434) exists
+only because ESP-IDF's raw `esp_ble_gattc` API and ESPHome's `ble_client`
+component write an 8-bit value to the notify Client Characteristic
+Configuration Descriptor where the BLE spec requires 16 bits, forcing ESPHome
+to redo that write itself. That is an ESP-IDF/ESPHome implementation detail,
+not a BedJet protocol requirement. `bleak`'s `BleakClient.start_notify()`
+already performs a spec-correct 16-bit CCCD write on every backend; this
+module does nothing special here and needs nothing special.
+"""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+import contextlib
+from datetime import datetime
+from enum import Enum, auto
 import logging
-from math import ceil
+import random
+import time
 
 from bleak import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak_retry_connector import (
-    BleakClientWithServiceCache,
-    BleakError,
-    establish_connection,
-)
+from bleak_retry_connector import BleakClientWithServiceCache, BleakError, establish_connection
 
-from .const import (
-    BedJetButton,
-    BedJetCommand,
-    BedJetNotification,
-    BioDataRequest,
-    OperatingMode,
+from .codec import (
+    BedJetFrameError,
+    BedJetState,
+    build_command,
+    decode_frame,
+    is_meaningful_change,
+    merge_tail,
 )
-from .helpers import calculate_maximum_runtime
-from .limiter import EndTimeLimiter, TemperatureLimiter
+from .const import BedJetButton, BedJetCommand, BedJetMode, BedJetNotification, BioDataRequest
 
 _LOGGER = logging.getLogger(__name__)
 
+__all__ = [
+    "BedJet",
+    "BedJetState",
+    "BedJetMode",
+    "BedJetButton",
+    "BedJetNotification",
+    "BedJetCommand",
+    "BedJetError",
+    "BedJetConnectionError",
+    "BedJetCommandError",
+    "BedJetFrameError",
+    "WatchdogAction",
+    "watchdog_action",
+    "reconnect_backoff_seconds",
+    "is_meaningful_change",
+    "decode_frame",
+    "merge_tail",
+    "build_command",
+]
 
-# BedJet V2 UUIDs (ISSC)
-BEDJET2_SERVICE_UUID = "49535343-fe7d-4ae5-8fa9-9fafd205e455"
-BEDJET2_STATUS_UUID = "49535343-1e4d-4bd9-ba61-23c647249616"
-BEDJET2_COMMAND_UUID = "49535343-8841-43f4-a8d4-ecbe34729bb3"
-BEDJET2_NOTIFICATION_LENGTH = 14
-BEDJET2_TEMPERATURE_MIN_MAX = (19.0, 43.0)
+# BedJet V3 GATT layout (see codec.py for the command/frame byte-level map).
+SERVICE_UUID = "00001000-bed0-0080-aa55-4265644a6574"
+STATUS_UUID = "00002000-bed0-0080-aa55-4265644a6574"  # notify (20B) + plain read (tail, 11B)
+COMMAND_UUID = "00002004-bed0-0080-aa55-4265644a6574"  # write-without-response
+BIODATA_FULL_UUID = "00002006-bed0-0080-aa55-4265644a6574"  # GET_BIO response read
+# NOTE: the prior fork also declared characteristic ...2001 (device name),
+# ...2002/...2003 (WiFi SSID/password - BedJet 3's separate cloud/app Wi-Fi
+# setup, irrelevant to BLE climate control) and ...2005 ("BIODATA", short).
+# None of them were ever read from or written to anywhere in this fork's
+# history (verified by grep across every revision of __init__.py) - removed
+# as dead surface. Only ...2006 (BIODATA_FULL) is actually used, for GET_BIO
+# responses.
 
-# BedJet 3 UUIDs
-BEDJET3_SERVICE_UUID = "00001000-bed0-0080-aa55-4265644a6574"
-BEDJET3_STATUS_UUID = "00002000-bed0-0080-aa55-4265644a6574"
-BEDJET3_NAME_UUID = "00002001-bed0-0080-aa55-4265644a6574"
-BEDJET3_SSID_UUID = "00002002-bed0-0080-aa55-4265644a6574"
-BEDJET3_PASSWORD_UUID = "00002003-bed0-0080-aa55-4265644a6574"
-BEDJET3_COMMAND_UUID = "00002004-bed0-0080-aa55-4265644a6574"
-BEDJET3_BIODATA_UUID = "00002005-bed0-0080-aa55-4265644a6574"
-BEDJET3_BIODATA_FULL_UUID = "00002006-bed0-0080-aa55-4265644a6574"
-BEDJET3_NOTIFICATION_LENGTH = 20
-BEDJET3_STATUS_LENGTH = 11
+# Clock hook so tests can control elapsed-time math deterministically without
+# real sleeps; production code always uses the real time.monotonic default.
+_monotonic: Callable[[], float] = time.monotonic
 
-CLIENT_CHARACTERISTIC_CONFIG = "00002902-0000-1000-8000-00805f9b34fb"
+# Command confirmation timeout (Contract: "each awaits confirming frame with
+# timeout 5s").
+COMMAND_TIMEOUT_S = 5.0
 
-DISCONNECT_DELAY = 60
+# Watchdog tiers. 300s/900s mirror ESPHome's own NOTIFY_WARN_THRESHOLD and
+# DEFAULT_STATUS_TIMEOUT (bedjet_hub.h:148-149); 60s has no ESPHome citation
+# and is this library's own addition - see codec.py docstring "[INFERENCE]
+# tags summary".
+WATCHDOG_PROBE_AFTER_S = 60.0
+STATUS_TIMEOUT_S = 300.0
+WATCHDOG_RECONNECT_AFTER_S = 900.0
+WATCHDOG_TICK_S = 10.0
 
-OPERATING_MODE_BUTTON_MAP = {
-    OperatingMode.STANDBY: BedJetButton.OFF,
-    OperatingMode.HEAT: BedJetButton.HEAT,
-    OperatingMode.TURBO: BedJetButton.TURBO,
-    OperatingMode.EXTENDED_HEAT: BedJetButton.EXTENDED_HEAT,
-    OperatingMode.COOL: BedJetButton.COOL,
-    OperatingMode.DRY: BedJetButton.DRY,
+# Reconnect backoff (full jitter).
+RECONNECT_BACKOFF_MIN_S = 2.0
+RECONNECT_BACKOFF_MAX_S = 120.0
+
+# Tail re-read staleness threshold - ESPHome's own MIN_NOTIFY_THROTTLE
+# (bedjet_hub.h:147).
+TAIL_MAX_AGE_S = 15.0
+
+# Listener fan-out rate limit for continuous-only changes (actual/ambient
+# temperature). A mode/fan/target/notification/tail-flag change always
+# publishes immediately regardless of this limit - see `is_meaningful_change`.
+PUBLISH_MIN_INTERVAL_S = 2.0
+
+# Upper bound on one connect+discover+subscribe attempt, so a hung transport
+# (e.g. a misbehaving proxy hop) cannot park the reconnect supervisor forever.
+CONNECT_ATTEMPT_TIMEOUT_S = 60.0
+
+# Best-effort memory-name read retry budget (matches the prior fork's `tag <
+# 2` loop bound).
+BIO_READ_ATTEMPTS = 2
+
+_MODE_TO_BUTTON: dict[BedJetMode, BedJetButton] = {
+    BedJetMode.STANDBY: BedJetButton.OFF,
+    BedJetMode.HEAT: BedJetButton.HEAT,
+    BedJetMode.TURBO: BedJetButton.TURBO,
+    BedJetMode.EXTENDED_HEAT: BedJetButton.EXTENDED_HEAT,
+    BedJetMode.COOL: BedJetButton.COOL,
+    BedJetMode.DRY: BedJetButton.DRY,
 }
 
-STALE_AFTER_SECONDS = 60
+
+class BedJetError(Exception):
+    """Base exception for every pybedjet error."""
 
 
-@dataclass(frozen=True)
-class BedJetState:
-    """BedJet state."""
+class BedJetConnectionError(BedJetError):
+    """Raised when a command is attempted while not connected."""
 
-    current_temperature: float = 0
-    target_temperature: float = 0
-    operating_mode: OperatingMode = OperatingMode.STANDBY
-    runtime_remaining: timedelta = timedelta()
-    run_end_time: datetime | None = None
-    maximum_runtime: timedelta = timedelta()
-    turbo_time: timedelta = timedelta()
-    fan_speed: int = 0
 
-    minimum_temperature: float = 0
-    maximum_temperature: float = 0
-    ambient_temperature: float = 0
+class BedJetCommandError(BedJetError):
+    """Raised when a command's confirming frame did not arrive in time."""
+
+
+class WatchdogAction(Enum):
+    """Pure decision output of `watchdog_action`."""
+
+    NONE = auto()
+    PROBE = auto()
+    UNAVAILABLE = auto()
+    RECONNECT = auto()
+
+
+def watchdog_action(elapsed_s: float) -> WatchdogAction:
+    """Pure tier decision for the notify-stream watchdog.
+
+    `elapsed_s` is seconds since the last valid decoded frame. See the
+    Contract and codec.py's "[INFERENCE] tags summary" for provenance of the
+    three thresholds.
+    """
+    if elapsed_s >= WATCHDOG_RECONNECT_AFTER_S:
+        return WatchdogAction.RECONNECT
+    if elapsed_s >= STATUS_TIMEOUT_S:
+        return WatchdogAction.UNAVAILABLE
+    if elapsed_s >= WATCHDOG_PROBE_AFTER_S:
+        return WatchdogAction.PROBE
+    return WatchdogAction.NONE
+
+
+def reconnect_backoff_seconds(attempt: int, rng: random.Random | None = None) -> float:
+    """Pure full-jitter exponential backoff.
+
+    `attempt` is a 0-indexed consecutive-failure count. Returns a value
+    uniformly distributed between `RECONNECT_BACKOFF_MIN_S` and
+    `min(RECONNECT_BACKOFF_MAX_S, RECONNECT_BACKOFF_MIN_S * 2**attempt)`.
+    Pass a seeded `Random` for deterministic tests.
+    """
+    rng = rng or random.Random()
+    ceiling = min(RECONNECT_BACKOFF_MAX_S, RECONNECT_BACKOFF_MIN_S * (2**attempt))
+    return rng.uniform(RECONNECT_BACKOFF_MIN_S, ceiling)
+
+
+def _any_frame(_state: BedJetState) -> bool:
+    """Confirmation predicate for commands with no specific field to check."""
+    return True
+
+
+def _parse_memory_name(chunk: bytes) -> str | None:
+    """Best-effort decode of one 16-byte memory-name slot.
+
+    [INFERENCE] Not documented by ESPHome; reverse-engineered by the prior
+    fork's `_parse_bio_data_response`. `chunk[0] in (0, 1)` are both observed
+    "no custom name" sentinels (historically rendered as the literal string
+    "Default" / `None`); this library reports both as `None` so the HA layer
+    can fall back to the preset's own "M1"/"M2"/"M3" label - a small,
+    intentional behavior improvement over showing the word "Default" for an
+    un-named preset.
+    """
+    if not chunk or chunk[0] in (0, 1):
+        return None
+    name = chunk.split(b"\x00", 1)[0].decode(errors="replace").strip()
+    return name or None
+
+
+def _parse_memory_names(data: bytes) -> tuple[str | None, str | None, str | None] | None:
+    """Decode a GET_BIO(MEMORY_NAMES) response: [bio_type, tag, 3x16-byte name]."""
+    payload = data[2:]
+    if len(payload) < 48:
+        return None
+    m1, m2, m3 = (_parse_memory_name(payload[i * 16 : (i + 1) * 16]) for i in range(3))
+    return (m1, m2, m3)
 
 
 class BedJet:
-    """BedJet class."""
+    """Async BedJet V3 client over a shared Bluetooth stack.
 
-    _firmware_version: str | None = None
-    _biorhythm_names: list[str] | None = None
-    _memory_names: list[str] | None = None
-    _m1_name: str | None = None
-    _m2_name: str | None = None
-    _m3_name: str | None = None
-    _shutdown_reason: int | None = None
-
-    # status fields
-    _device_status_data: bytearray | None = None
-    _beeps_muted: bool | None = None
-    _bio_sequence_step: int | None = None
-    _connection_test_passed: bool | None = None
-    _dual_zone: bool | None = None
-    _led_enabled: bool | None = None
-    _notification: BedJetNotification | None = None
-    _units_setup: bool | None = None
-    _update_phase: int | None = None
-
-    # stale check
-    _last_update: datetime | None = None
-
-    # V2 Support Flag
-    _is_v2: bool = False
+    Owns exactly one BLE connection's lifecycle: connecting (only ever
+    triggered by `hold_connection` plus an advertisement sighting, never a
+    blind poll loop), subscribing to status notifications, reading the tail
+    when it is stale or a command just completed, confirming every command
+    against a real decoded frame, and a watchdog that notices a wedged
+    connection. See the module and `codec.py` docstrings for the full design
+    rationale.
+    """
 
     def __init__(
-        self, ble_device: BLEDevice, advertisement_data: AdvertisementData | None = None
+        self,
+        ble_device: BLEDevice,
+        advertisement_data: AdvertisementData | None = None,
+        *,
+        hold_connection: bool = True,
+        clock: Callable[[], datetime] | None = None,
+        source: str | None = None,
     ) -> None:
-        """Init the BedJet."""
+        """Init the BedJet client. Does not connect - call `start()`."""
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
-        self._operation_lock = asyncio.Lock()
-        self._state = BedJetState()
-        self._connect_lock: asyncio.Lock = asyncio.Lock()
-        self._auto_disconnect_timer: asyncio.TimerHandle | None = None
+        self._scanner_source = source
+        self._clock = clock
+        self._hold_connection = hold_connection
+
         self._client: BleakClientWithServiceCache | None = None
-        self._expected_disconnect = False
-        self.loop = asyncio.get_running_loop()
-        self._callbacks: list[Callable[[BedJetState], None]] = []
-        self._resolve_protocol_event = asyncio.Event()
-        self._name: str | None = None
+        self._state: BedJetState | None = None
+        self._last_frame_at: float | None = None
+        self._last_tail_read_at: float | None = None
+        self._tail_refresh_needed = False
+        self._last_published_at: float | None = None
+        self._last_unavailable_notice_at: float | None = None
 
-        # limiters
-        self._current_temperature_limiter = TemperatureLimiter()
-        self._ambient_temperature_limiter = TemperatureLimiter()
-        self._run_end_time_limiter = EndTimeLimiter()
+        self._callbacks: list[Callable[[BedJet], None]] = []
+        self._pending: list[tuple[Callable[[BedJetState], bool], asyncio.Future[None]]] = []
 
-    def set_ble_device_and_advertisement_data(
-        self, ble_device: BLEDevice, advertisement_data: AdvertisementData
-    ) -> None:
-        """Set the ble device."""
-        self._ble_device = ble_device
-        self._advertisement_data = advertisement_data
-        _LOGGER.debug("%s: RSSI=%s", self.name_and_address, self.rssi)
+        self._started = False
+        self._stopped = True
+        self._reconnect_attempt = 0
+        self._connect_wakeup = asyncio.Event()
+
+        self._connect_task: asyncio.Task[None] | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._tail_read_task: asyncio.Task[None] | None = None
+        self._bio_read_task: asyncio.Task[None] | None = None
+        self._release_task: asyncio.Task[None] | None = None
+
+        self._m1_name: str | None = None
+        self._m2_name: str | None = None
+        self._m3_name: str | None = None
+
+    # -- identity / static properties ---------------------------------
 
     @property
     def address(self) -> str:
-        """Return the address."""
+        """The device's BLE MAC address."""
         return self._ble_device.address
 
     @property
-    def is_v2(self) -> bool:
-        """Return True if connected to a V2 device."""
-        return self._is_v2
+    def scanner_source(self) -> str | None:
+        """The scanner (adapter or ESPHome proxy) that produced the last advertisement, if known."""
+        return self._scanner_source
+
+    # -- connection / freshness properties ------------------------------
 
     @property
-    def model(self) -> str:
-        """Return the model name based on the device version."""
-        return f"BedJet {'V2' if self._is_v2 else '3'}"
+    def connected(self) -> bool:
+        """True if a BLE connection is currently established and subscribed."""
+        return self._client is not None and self._client.is_connected
 
     @property
-    def beeps_muted(self) -> bool | None:
-        """Return `True` if beeps are muted."""
-        return self._beeps_muted
-
-    @property
-    def biorhythm1_name(self) -> str | None:
-        """Return the biorhythm 1 name."""
-        if self._biorhythm_names and (name := self._biorhythm_names[0]):
-            return name
-        return None
-
-    @property
-    def biorhythm2_name(self) -> str | None:
-        """Return the biorhythm 2 name."""
-        if self._biorhythm_names and (name := self._biorhythm_names[1]):
-            return name
-        return None
-
-    @property
-    def biorhythm3_name(self) -> str | None:
-        """Return the biorhythm 3 name."""
-        if self._biorhythm_names and (name := self._biorhythm_names[2]):
-            return name
-        return None
-
-    @property
-    def bio_sequence_step(self) -> int | None:
-        """Return the current bio sequence step."""
-        return self._bio_sequence_step
-
-    @property
-    def connection_test_passed(self) -> bool | None:
-        """Return if the connection test passed."""
-        return self._connection_test_passed
-
-    @property
-    def dual_zone(self) -> bool | None:
-        """Return `True` if part of a dual zone setup."""
-        return self._dual_zone
-
-    @property
-    def firmware_version(self) -> str | None:
-        """Return the firmware version."""
-        return self._firmware_version
-
-    @property
-    def is_data_stale(self) -> bool:
-        """Return `True` if the data should be considered stale based on last update."""
+    def available(self) -> bool:
+        """True if connected AND a valid frame arrived within `STATUS_TIMEOUT_S`."""
         return (
-            self._last_update is None
-            or (datetime.now(UTC) - self._last_update).total_seconds()
-            > STALE_AFTER_SECONDS
+            self.connected
+            and self._last_frame_at is not None
+            and (_monotonic() - self._last_frame_at) < STATUS_TIMEOUT_S
         )
 
     @property
-    def led_enabled(self) -> bool | None:
-        """Return if LED ring is enabled."""
-        return self._led_enabled
+    def last_frame_at(self) -> float | None:
+        """`time.monotonic()` timestamp of the last valid decoded frame, or None."""
+        return self._last_frame_at
+
+    @property
+    def state(self) -> BedJetState | None:
+        """The most recently decoded state, or None before the first valid frame."""
+        return self._state
+
+    # -- best-effort bio-data (memory preset names) --------------------
 
     @property
     def m1_name(self) -> str | None:
-        """Return the M1 memory name."""
-        if self._memory_names and (name := self._memory_names[0]):
-            return f"M1: {name}"
-        return None
+        """The user-configured name of the M1 memory preset, if read successfully."""
+        return self._m1_name
 
     @property
     def m2_name(self) -> str | None:
-        """Return the M2 memory name."""
-        if self._memory_names and (name := self._memory_names[1]):
-            return f"M2: {name}"
-        return None
+        """The user-configured name of the M2 memory preset, if read successfully."""
+        return self._m2_name
 
     @property
     def m3_name(self) -> str | None:
-        """Return the M3 memory name."""
-        if self._memory_names and (name := self._memory_names[2]):
-            return f"M3: {name}"
-        return None
+        """The user-configured name of the M3 memory preset, if read successfully."""
+        return self._m3_name
+
+    # -- hold_connection --------------------------------------------------
 
     @property
-    def name(self) -> str:
-        """Get the name of the device."""
-        return self._name or self._ble_device.name or self._ble_device.address
+    def hold_connection(self) -> bool:
+        """True = connect and maintain; False = disconnected and will not reconnect."""
+        return self._hold_connection
 
-    @property
-    def name_and_address(self) -> str:
-        """Get the name and address of the device."""
-        return f"{self.name} ({self.address})"
-
-    @property
-    def notification(self) -> BedJetNotification | None:
-        """Return the current notification."""
-        return self._notification
-
-    @property
-    def rssi(self) -> int | None:
-        """Get the rssi of the device."""
-        if self._advertisement_data:
-            return self._advertisement_data.rssi
-        return None
-
-    @property
-    def shutdown_reason(self) -> int | None:
-        """Return the shutdown reason."""
-        return self._shutdown_reason
-
-    @property
-    def state(self) -> BedJetState:
-        """Return the current state."""
-        return self._state
-
-    @property
-    def units_setup(self) -> bool | None:
-        """Return `True` if units have been setup."""
-        return self._units_setup
-
-    @property
-    def update_phase(self) -> int | None:
-        """Return the update phase."""
-        return self._update_phase
-
-    async def set_clock(self, hour: int, minute: int) -> None:
-        """Set the clock."""
-        if not 0 <= hour <= 23:
-            raise ValueError(f"Invalid hour: {hour} (range is [0, 23])")
-        if not 0 <= minute <= 59:
-            raise ValueError(f"Invalid minute: {minute} (range is [0, 59])")
-        command = bytearray((BedJetCommand.SET_CLOCK, hour, minute))
-        await self._send_command(command)
-
-    async def set_fan_speed(self, fan_speed: int) -> None:
-        """Set fan speed."""
-        if self._is_v2:
-            # V2 Protocol: SET_FAN (0x07)
-            # Packet: 58 07 0E [MODE] [STEP] [TEMP] [HRS] [MIN] 00 [CHK]
-
-            # 1. Determine Mode ID from current state
-            mode_id = 0x02  # Default Heat
-            if self.state.operating_mode == OperatingMode.TURBO:
-                mode_id = 0x01
-            elif self.state.operating_mode == OperatingMode.HEAT:
-                mode_id = 0x02
-            elif self.state.operating_mode == OperatingMode.COOL:
-                mode_id = 0x03
-
-            # 2. Calculate Fan Step
-            step = int(fan_speed / 5)
-
-            # 3. Handle Timer Preservation
-            total_seconds = int(self.state.runtime_remaining.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-
-            # 4. Handle Temperature and Mute Flag
-            temp_byte = round(self.state.target_temperature * 2)
-
-            # If currently Muted, add 0x80 to bitmask to PRESERVE mute state
-            if self.beeps_muted:
-                temp_byte |= 0x80
-
-            payload = bytearray(
-                [0x07, 0x0E, mode_id, step, temp_byte, hours, minutes, 0x00]
-            )
-            await self._send_command(payload)
+    @hold_connection.setter
+    def hold_connection(self, value: bool) -> None:
+        if value == self._hold_connection:
             return
+        self._hold_connection = value
+        if value:
+            self._reconnect_attempt = 0
+        self._connect_wakeup.set()
+        if not value and self._client is not None:
+            self._release_task = asyncio.create_task(self._disconnect())
 
-        # Original V3 Command
-        command = bytearray((BedJetCommand.SET_FAN, int(fan_speed / 5) - 1))
-        await self._send_command(command)
+    # -- advertisement feed / callbacks --------------------------------
 
-    async def set_led(self, led: bool) -> None:
-        """Set LED."""
-        if self._is_v2:
-            # V2 Protocol: CMD_SET_SETTINGS (0x11)
-            # Settings Byte: Bit 0 = Mute, Bit 1 = LED Off
-            settings_byte = 0x00
+    def set_ble_device_and_advertisement_data(
+        self,
+        ble_device: BLEDevice,
+        advertisement_data: AdvertisementData,
+        *,
+        source: str | None = None,
+    ) -> None:
+        """Feed a fresh advertisement sighting.
 
-            # Preserve current Mute state
-            if self.beeps_muted:
-                settings_byte |= 0x01
+        An advertisement means the device's single BLE slot is currently
+        free (a BedJet does not advertise while connected to anyone) - this
+        is what wakes the reconnect supervisor, bypassing backoff early.
+        """
+        self._ble_device = ble_device
+        self._advertisement_data = advertisement_data
+        if source is not None:
+            self._scanner_source = source
+        self._connect_wakeup.set()
 
-            # Apply new LED state (Bit 1 is "Off")
-            if not led:
-                settings_byte |= 0x02
+    def register_callback(self, callback: Callable[[BedJet], None]) -> Callable[[], None]:
+        """Register a callback fired on every observable change.
 
-            await self._send_command(bytearray([0x02, 0x11, settings_byte]))
-            self._led_enabled = led
-            self._fire_callbacks()
-            return
+        Fires on: every decoded frame (rate-limited per
+        `is_meaningful_change`/`PUBLISH_MIN_INTERVAL_S`), every successful
+        connect, every disconnect, and the watchdog's UNAVAILABLE tier.
+        Returns a function that unregisters it.
+        """
+        self._callbacks.append(callback)
 
-        # Original V3 Command
-        button = BedJetButton.LED_ON if led else BedJetButton.LED_OFF
-        command = bytearray((BedJetCommand.BUTTON, button))
-        await self._send_command(command)
-        self._led_enabled = led
-        self._fire_callbacks()
+        def unregister() -> None:
+            with contextlib.suppress(ValueError):
+                self._callbacks.remove(callback)
 
-    async def set_muted(self, muted: bool) -> None:
-        """Set muted."""
-        if self._is_v2:
-            # V2 Protocol: CMD_SET_SETTINGS (0x11)
-            # Settings Byte: Bit 0 = Mute, Bit 1 = LED Off
-            settings_byte = 0x00
-
-            # Apply new Mute state
-            if muted:
-                settings_byte |= 0x01
-
-            # Preserve current LED state (Bit 1 is "Off")
-            if self.led_enabled is False:
-                settings_byte |= 0x02
-
-            await self._send_command(bytearray([0x02, 0x11, settings_byte]))
-            self._beeps_muted = muted
-            self._fire_callbacks()
-            return
-
-        # Original V3 Command
-        button = BedJetButton.MUTE if muted else BedJetButton.UNMUTE
-        command = bytearray((BedJetCommand.BUTTON, button))
-        await self._send_command(command)
-        self._beeps_muted = muted
-        self._fire_callbacks()
-
-    async def set_operating_mode(self, operating_mode: OperatingMode) -> None:
-        """Set operating mode."""
-        if self._is_v2:
-            # V2 Protocol: Button Events (0x02)
-            target_btn = None
-            if operating_mode == OperatingMode.TURBO:
-                target_btn = 0x01
-            elif operating_mode == OperatingMode.HEAT:
-                target_btn = 0x02
-            elif operating_mode == OperatingMode.COOL:
-                target_btn = 0x03
-            elif operating_mode != OperatingMode.STANDBY:
-                raise ValueError(f"Unsupported V2 operating mode: {operating_mode}")
-
-            # Handle OFF (Standby)
-            if operating_mode == OperatingMode.STANDBY:
-                # Toggle current mode to turn off
-                curr = self.state.operating_mode
-                off_btn = None
-                if curr == OperatingMode.TURBO:
-                    off_btn = 0x01
-                elif curr == OperatingMode.HEAT:
-                    off_btn = 0x02
-                elif curr == OperatingMode.COOL:
-                    off_btn = 0x03
-
-                if off_btn:
-                    await self._send_command(bytearray([0x02, 0x01, off_btn]))
-                    try:
-                        async with asyncio.timeout(5):
-                            while self.state.operating_mode != OperatingMode.STANDBY:
-                                await asyncio.sleep(0.1)
-                    except TimeoutError:
-                        _LOGGER.warning(
-                            "%s: Could not confirm V2 operating mode change in 5 seconds",
-                            self.name_and_address,
-                        )
-                return
-
-            # Handle ON (Mode Switch)
-            if target_btn:
-                # If already in mode, do nothing (unless it's Turbo, which we might want to refresh)
-                if (
-                    operating_mode != OperatingMode.TURBO
-                    and self.state.operating_mode == operating_mode
-                ):
-                    return
-
-                await self._send_command(bytearray([0x02, 0x01, target_btn]))
-                try:
-                    async with asyncio.timeout(5):
-                        while self.state.operating_mode != operating_mode:
-                            await asyncio.sleep(0.1)
-                except TimeoutError:
-                    _LOGGER.warning(
-                        "%s: Could not confirm V2 operating mode change in 5 seconds",
-                        self.name_and_address,
-                    )
-            return
-
-        # Original V3 Command
-        command = bytearray(
-            (BedJetCommand.BUTTON, OPERATING_MODE_BUTTON_MAP[operating_mode])
-        )
-        await self._send_command(command)
-        try:
-            async with asyncio.timeout(1):
-                while self.state.operating_mode != operating_mode:
-                    await asyncio.sleep(0.1)
-        except TimeoutError:
-            _LOGGER.warning(
-                "%s: Could not confirm if operating mode was set in 1 second",
-                self.name_and_address,
-            )
-
-    async def set_runtime_remaining(self, hours: int = 0, minutes: int = 0) -> None:
-        """Set runtime remaining."""
-        if self._is_v2:
-            _LOGGER.warning(
-                "%s: set_runtime_remaining is not supported on V2 devices",
-                self.name_and_address,
-            )
-            return
-
-        if minutes >= 60:
-            hours += int(minutes / 60)
-            minutes = minutes % 60
-        command = bytearray((BedJetCommand.SET_RUNTIME, hours, minutes))
-        await self._send_command(command)
-
-    async def set_temperature(self, temperature: float) -> None:
-        """Set temperature."""
-        if self._is_v2:
-            # V2 Protocol: CMD_SET_TEMP (0x02 0x07)
-            temp_byte = round(temperature * 2)
-
-            # Preserve Mute State
-            if self.beeps_muted:
-                temp_byte |= 0x80
-
-            await self._send_command(bytearray([0x02, 0x07, temp_byte]))
-            return
-
-        # Original V3 Command
-        command = bytearray((BedJetCommand.SET_TEMPERATURE, round(temperature * 2)))
-        await self._send_command(command)
-
-    async def update(self) -> None:
-        """Update the BedJet."""
-        _LOGGER.debug("%s: Updating", self.name_and_address)
-        await self._ensure_connected()
-
-        if not self._is_v2:
-            await self._read_device_status()
-            await self._read_memory_names()
-            await self._read_biorhythm_names()
-
-        try:
-            async with asyncio.timeout(5.0):
-                while self._state.current_temperature == 0:
-                    await asyncio.sleep(0.1)
-        except TimeoutError:
-            pass
-
-    async def disconnect(self) -> None:
-        """Disconnect from the BedJet."""
-        _LOGGER.debug("%s: Disconnect", self.name_and_address)
-        await self._execute_disconnect()
+        return unregister
 
     def _fire_callbacks(self) -> None:
-        """Fire the callbacks."""
-        for callback in self._callbacks:
-            callback(self._state)
+        for callback in list(self._callbacks):
+            try:
+                callback(self)
+            except Exception:
+                _LOGGER.exception("%s: registered callback raised", self.address)
 
-    def register_callback(
-        self, callback: Callable[[BedJetState], None]
-    ) -> Callable[[], None]:
-        """Register a callback to be called when the state changes."""
+    # -- lifecycle ------------------------------------------------------
 
-        def unregister_callback() -> None:
-            self._callbacks.remove(callback)
+    async def start(self) -> None:
+        """Begin the connection lifecycle. Idempotent; returns promptly.
 
-        self._callbacks.append(callback)
-        return unregister_callback
-
-    async def _ensure_connected(self) -> None:
-        """Ensure connection to device is established."""
-        if self._connect_lock.locked():
-            _LOGGER.debug(
-                "%s: Connection already in progress, waiting for it to complete",
-                self.name_and_address,
-            )
-        if self._client and self._client.is_connected:
-            self._reset_disconnect_timer()
+        Never blocks on, or raises for, the device not being reachable right
+        now - it only arranges to keep trying (advertisement-triggered, with
+        backoff) until `stop()` or `hold_connection = False`.
+        """
+        if self._started:
             return
-        async with self._connect_lock:
-            # Check again while holding the lock
-            if self._client and self._client.is_connected:
-                self._reset_disconnect_timer()
-                return
-            _LOGGER.debug("%s: Connecting", self.name_and_address)
+        self._started = True
+        self._stopped = False
+        self._reconnect_attempt = 0
+        self._connect_wakeup.set()
+        self._connect_task = asyncio.create_task(self._connect_supervisor())
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def stop(self) -> None:
+        """Stop the connection lifecycle and disconnect. Idempotent."""
+        self._stopped = True
+        self._connect_wakeup.set()
+        tasks = [t for t in (self._connect_task, self._watchdog_task, self._release_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._connect_task = None
+        self._watchdog_task = None
+        self._release_task = None
+        await self._disconnect()
+        self._started = False
+
+    # -- commands ---------------------------------------------------------
+    # Every command awaits a confirming frame (never optimistic local state)
+    # and raises BedJetConnectionError if not connected, or BedJetCommandError
+    # if no confirming frame arrives within COMMAND_TIMEOUT_S.
+
+    async def set_mode(self, mode: BedJetMode) -> None:
+        """Press the button that switches to `mode`; confirmed by `state.mode`."""
+        button = _MODE_TO_BUTTON.get(mode)
+        if button is None:
+            raise ValueError(f"{mode!r} cannot be set directly (no button exists for it)")
+        await self._run_command(
+            build_command(BedJetCommand.BUTTON, button),
+            lambda state: state.mode == mode,
+        )
+
+    async def set_temperature_c(self, temperature_c: float) -> None:
+        """Set the target temperature in Celsius; confirmed by `state.target_temp_c`."""
+        target_raw = round(temperature_c * 2)
+        await self._run_command(
+            build_command(BedJetCommand.SET_TEMP, temperature_c),
+            lambda state: round(state.target_temp_c * 2) == target_raw,
+        )
+
+    async def set_fan_percent(self, fan_percent: int) -> None:
+        """Set the fan speed as a percent (5-100, multiple of 5); confirmed by `state.fan_percent`."""
+        await self._run_command(
+            build_command(BedJetCommand.SET_FAN, fan_percent),
+            lambda state: state.fan_percent == fan_percent,
+        )
+
+    async def set_runtime(self, hours: int, minutes: int) -> None:
+        """Set the absolute time remaining; confirmed by `state.time_remaining` (to the minute).
+
+        Seconds are intentionally ignored for confirmation: `time_remaining`
+        is a live countdown, so an exact-seconds comparison would be flaky
+        against network/decode latency.
+        """
+        target_minutes = hours * 60 + minutes
+        await self._run_command(
+            build_command(BedJetCommand.SET_RUNTIME, hours, minutes),
+            lambda state: int(state.time_remaining.total_seconds()) // 60 == target_minutes,
+        )
+
+    async def set_led(self, led: bool) -> None:
+        """Enable/disable the LED ring; confirmed by `state.leds_enabled` (tail-derived)."""
+        button = BedJetButton.LED_ON if led else BedJetButton.LED_OFF
+        await self._run_command(
+            build_command(BedJetCommand.BUTTON, button),
+            lambda state: state.leds_enabled == led,
+        )
+
+    async def set_mute(self, muted: bool) -> None:
+        """Mute/unmute beeps; confirmed by `state.beeps_muted` (tail-derived)."""
+        button = BedJetButton.MUTE if muted else BedJetButton.UNMUTE
+        await self._run_command(
+            build_command(BedJetCommand.BUTTON, button),
+            lambda state: state.beeps_muted == muted,
+        )
+
+    async def sync_clock(self) -> None:
+        """Send the current time from the configured `clock`; resolves on the next valid frame."""
+        if self._clock is None:
+            raise BedJetError(f"{self.address}: no clock source configured")
+        now = self._clock()
+        await self._run_command(build_command(BedJetCommand.SET_CLOCK, now.hour, now.minute), _any_frame)
+
+    async def acknowledge_notification(self) -> None:
+        """Send NOTIFY_ACK; resolves on the next valid frame."""
+        await self._run_command(build_command(BedJetCommand.BUTTON, BedJetButton.NOTIFY_ACK), _any_frame)
+
+    async def press_button(self, button: BedJetButton) -> None:
+        """Press an arbitrary button (e.g. an M1/M2/M3 preset); resolves on the next valid frame."""
+        await self._run_command(build_command(BedJetCommand.BUTTON, button), _any_frame)
+
+    async def request_status(self) -> None:
+        """Send an explicit CMD_STATUS probe; resolves on the next valid frame.
+
+        [INFERENCE] see codec.py docstring - ESPHome never sends this opcode
+        itself; kept as a watchdog nudge per the ground truth.
+        """
+        await self._run_command(build_command(BedJetCommand.STATUS), _any_frame)
+
+    async def request_firmware_update(self) -> None:
+        """Press MAGIC_UPDATE, which reboots the unit; resolves on the next valid frame.
+
+        A timeout here is an expected, honest outcome if the unit reboots
+        before sending another frame - this call never assumes success.
+        """
+        await self._run_command(build_command(BedJetCommand.BUTTON, BedJetButton.UPDATE_FIRMWARE), _any_frame)
+
+    async def _run_command(self, command_bytes: bytes, predicate: Callable[[BedJetState], bool]) -> None:
+        if self._client is None or not self._client.is_connected:
+            raise BedJetConnectionError(f"{self.address}: not connected")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        entry = (predicate, future)
+        self._pending.append(entry)
+        try:
+            await self._client.write_gatt_char(COMMAND_UUID, command_bytes, response=False)
+            self._tail_refresh_needed = True
+            async with asyncio.timeout(COMMAND_TIMEOUT_S):
+                await future
+        except BleakError as err:
+            raise BedJetConnectionError(f"{self.address}: write failed: {err}") from err
+        except TimeoutError as err:
+            raise BedJetCommandError(
+                f"{self.address}: command {command_bytes.hex()} not confirmed within {COMMAND_TIMEOUT_S}s"
+            ) from err
+        finally:
+            if entry in self._pending:
+                self._pending.remove(entry)
+
+    def _resolve_pending(self, state: BedJetState) -> None:
+        if not self._pending:
+            return
+        remaining = []
+        for predicate, future in self._pending:
+            if future.done():
+                continue
+            if predicate(state):
+                future.set_result(None)
+            else:
+                remaining.append((predicate, future))
+        self._pending = remaining
+
+    def _fail_pending(self, error: BedJetError) -> None:
+        for _predicate, future in self._pending:
+            if not future.done():
+                future.set_exception(error)
+        self._pending = []
+
+    # -- connection supervisor -------------------------------------------
+
+    async def _connect_supervisor(self) -> None:
+        """The single task that owns connecting and reconnecting.
+
+        Waits for a wakeup (advertisement, hold_connection toggle, disconnect,
+        or stop()) whenever there is nothing to do; otherwise attempts one
+        connection and backs off (with jitter) on failure. Never raises -
+        must run for the lifetime of the client. The outer try/except is a
+        last-resort guard: even a failure *inside* the inner handler (e.g. a
+        logging call) must never terminate the loop that is this client's
+        only path back to a working connection.
+        """
+        while not self._stopped:
+            try:
+                if not self._hold_connection or self.connected:
+                    await self._wait_for_wakeup()
+                    continue
+                try:
+                    await self._connect_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:  # noqa: BLE001 - the supervisor must never die
+                    self._reconnect_attempt += 1
+                    delay = reconnect_backoff_seconds(self._reconnect_attempt - 1)
+                    _LOGGER.debug(
+                        "%s: connect attempt %d failed (%s); retrying in %.1fs",
+                        self.address,
+                        self._reconnect_attempt,
+                        err,
+                        delay,
+                    )
+                    await self._wait_for_wakeup(timeout=delay)
+                else:
+                    self._reconnect_attempt = 0
+                    if not self._hold_connection:
+                        # hold_connection was released while the connect was
+                        # in flight; honor that now instead of staying connected.
+                        await self._disconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("unexpected error in BedJet connect supervisor")
+                with contextlib.suppress(Exception):
+                    await asyncio.sleep(RECONNECT_BACKOFF_MIN_S)
+
+    async def _wait_for_wakeup(self, timeout: float | None = None) -> None:
+        self._connect_wakeup.clear()
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout):
+                await self._connect_wakeup.wait()
+
+    async def _connect_once(self) -> None:
+        async with asyncio.timeout(CONNECT_ATTEMPT_TIMEOUT_S):
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 self._ble_device,
-                self.name,
-                self._disconnected,
+                self.address,
+                self._handle_disconnect,
                 use_services_cache=True,
                 ble_device_callback=lambda: self._ble_device,
             )
-            _LOGGER.debug("%s: Connected", self.name_and_address)
+            try:
+                await client.start_notify(STATUS_UUID, self._handle_notify)
+            except BaseException:
+                with contextlib.suppress(BleakError, OSError, EOFError):
+                    await client.disconnect()
+                raise
 
-            self._client = client
-            self._reset_disconnect_timer()
-
-            # V2 Protocol Detection
-            if client.services.get_characteristic(BEDJET2_STATUS_UUID):
-                self._is_v2 = True
-                status_uuid = BEDJET2_STATUS_UUID
-                # V2 Init Packet (Wake Up)
-                await client.write_gatt_char(
-                    BEDJET2_COMMAND_UUID,
-                    bytearray([0x58, 0x01, 0x0B, 0x9B]),
-                    response=False,
-                )
-                await asyncio.sleep(3.0)
-            else:
-                self._is_v2 = False
-                status_uuid = BEDJET3_STATUS_UUID
-
-            _LOGGER.debug("%s: Subscribe to notifications", self.name_and_address)
-
-            for attempt in range(3):
-                try:
-                    await client.start_notify(
-                        status_uuid,
-                        self._notification_handler,
-                        cb={
-                            "notification_discriminator": self._notification_check_handler
-                        },
-                    )
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(1.0)
-
-            if not self._is_v2:
-                if self._device_status_data is None:
-                    await self._read_device_status()
-                if not self._name:
-                    await self._read_device_name()
-                if not self._firmware_version:
-                    await self._read_device_firmware()
-            else:
-                self._name = "BedJet V2"
-                self._firmware_version = "ISSC V2"
-
-    def _notification_check_handler(self, data: bytes) -> bool:
-        """Verify notification data matches expected length."""
-        if self._is_v2:
-            return len(data) == BEDJET2_NOTIFICATION_LENGTH
-        return len(data) == BEDJET3_NOTIFICATION_LENGTH
-
-    def _decode_temperature(self, value: int) -> float:
-        """Decode temperature from a notification.
-
-        Temperatures are reported in degrees Celsius * 2.
-        BedJet V2 temperatures have a mask 0x7F
-        """
-        return ((value & 0x7F) if self._is_v2 else value) / 2
-
-    def _notification_handler(
-        self, _sender: BleakGATTCharacteristic, data: bytearray
-    ) -> None:
-        """Handle notification responses.
-
-        Temperatures are reported in degrees Celsius * 2.
-        """
-        _LOGGER.debug(
-            "%s: Notification received: %s", self.name_and_address, data.hex()
-        )
-        self._last_update = _now = datetime.now(UTC)
-
-        if self._is_v2:
-            self._handle_v2_notification(data, _now)
-            return
-
-        if len(data) != BEDJET3_NOTIFICATION_LENGTH:
-            _LOGGER.debug(
-                "%s: Unexpected notification received: %s",
-                self.name_and_address,
-                data.hex(),
-            )
-            return
-
-        hours_remaining = data[4]
-        minutes_remaining = data[5]
-        seconds_remaining = data[6]
-        current_temperature = self._current_temperature_limiter.update(
-            self._decode_temperature(data[7]), _now
-        )
-        target_temperature = self._decode_temperature(data[8])
-        operating_mode = OperatingMode(data[9])
-        fan_step = data[10]
-        maximum_hours = data[11]
-        maximum_minutes = data[12]
-        minimum_temperature = self._decode_temperature(data[13])
-        maximum_temperature = self._decode_temperature(data[14])
-        turbo_time = int.from_bytes(data[15 : 15 + 2], byteorder="big")
-        ambient_temperature = self._ambient_temperature_limiter.update(
-            self._decode_temperature(data[17]), _now
-        )
-        self._shutdown_reason = data[18]
-
-        runtime_remaining = timedelta(
-            hours=hours_remaining, minutes=minutes_remaining, seconds=seconds_remaining
-        )
-        run_end_time = self._run_end_time_limiter.update(runtime_remaining, _now)
-        maximum_runtime = timedelta(hours=maximum_hours, minutes=maximum_minutes)
-        fan_speed = (fan_step + 1) * 5
-
-        self._state = BedJetState(
-            current_temperature=current_temperature,
-            target_temperature=target_temperature,
-            operating_mode=operating_mode,
-            runtime_remaining=runtime_remaining,
-            run_end_time=run_end_time,
-            maximum_runtime=maximum_runtime,
-            turbo_time=timedelta(seconds=turbo_time),
-            fan_speed=fan_speed,
-            minimum_temperature=minimum_temperature,
-            maximum_temperature=maximum_temperature,
-            ambient_temperature=ambient_temperature,
-        )
-
+        self._client = client
+        self._last_frame_at = _monotonic()
+        self._last_tail_read_at = None
+        _LOGGER.debug("%s: connected", self.address)
         self._fire_callbacks()
 
-    def _handle_v2_notification(self, data: bytearray, _now: datetime) -> None:
-        """Handle ISSC V2 notification responses."""
-        if len(data) != BEDJET2_NOTIFICATION_LENGTH:
-            _LOGGER.debug(
-                "%s: Unexpected notification received: %s",
-                self.name_and_address,
-                data.hex(),
-            )
-            return
+        if self._clock is not None:
+            try:
+                await self.sync_clock()
+            except BedJetError as err:
+                _LOGGER.debug("%s: clock sync after connect failed: %s", self.address, err)
 
-        b4, b5 = data[4], data[5]
-        operating_mode = OperatingMode.STANDBY
-        fan_speed = 0
+        self._start_bio_read()
 
-        # Mode and fan detection
-        # COOL: 97-116
-        if 97 <= b4 <= 116:
-            operating_mode = OperatingMode.COOL
-            fan_speed = (b4 - 96) * 5
-        # HEAT: 65-84
-        elif 65 <= b4 <= 84:
-            operating_mode = OperatingMode.HEAT
-            fan_speed = (b4 - 64) * 5
-        # TURBO: 33-52 (0x21-0x34)
-        elif 33 <= b4 <= 52:
-            operating_mode = OperatingMode.TURBO
-            fan_speed = (b4 - 32) * 5
-        # OFF: 0x14 (20) or 0x0E (14) or Byte5=0
-        elif b4 == 0x14 or b4 == 0x0E or b5 == 0x00:
-            operating_mode = OperatingMode.STANDBY
-
-        # Turbo fallback
-        if b5 in (0x01, 0x02, 0x03, 0x04) and operating_mode == OperatingMode.STANDBY:
-            operating_mode = OperatingMode.TURBO
-            fan_speed = 100
-
-        # Retain fan speed if off (prevents UI error)
-        if operating_mode == OperatingMode.STANDBY:
-            fan_speed = self._state.fan_speed if self._state.fan_speed > 0 else 5
-        else:
-            if fan_speed > 0:
-                fan_speed = round(fan_speed / 5.0) * 5
-                fan_speed = max(5, min(100, fan_speed))
-            else:
-                fan_speed = 5
-
-        current_temperature = self._current_temperature_limiter.update(
-            self._decode_temperature(data[3]), _now
-        )
-        target_temperature = self._decode_temperature(data[7])
-
-        if operating_mode == OperatingMode.TURBO:
-            # target temperature is not reported when in turbo mode, so we set it to max
-            target_temperature = BEDJET2_TEMPERATURE_MIN_MAX[1]
-
-        hours = b5 >> 4
-        sub_raw = ((b5 & 0x0F) << 8) | data[6]
-        total_seconds = hours * 3600 + (sub_raw * 60 + 32) // 64
-        runtime_remaining = timedelta(seconds=total_seconds)
-        run_end_time = self._run_end_time_limiter.update(runtime_remaining, _now)
-        maximum_runtime = calculate_maximum_runtime(target_temperature, fan_speed)
-
-        # Status flags (byte 8)
-        self._beeps_muted = bool(data[8] & 0x80)
-        self._led_enabled = not bool(data[3] & 0x80)
-
-        turbo_time = max(0, 600 - data[11])
-
-        self._state = BedJetState(
-            current_temperature=current_temperature,
-            target_temperature=target_temperature,
-            operating_mode=operating_mode,
-            runtime_remaining=runtime_remaining,
-            run_end_time=run_end_time,
-            maximum_runtime=maximum_runtime,
-            turbo_time=timedelta(seconds=turbo_time),
-            fan_speed=fan_speed,
-            minimum_temperature=BEDJET2_TEMPERATURE_MIN_MAX[0],
-            maximum_temperature=BEDJET2_TEMPERATURE_MIN_MAX[1],
-            ambient_temperature=current_temperature,
-        )
+    def _handle_disconnect(self, _client: BleakClientWithServiceCache) -> None:
+        """bleak's disconnected_callback - always sync, may fire for any disconnect reason."""
+        if self._client is None:
+            return  # already torn down via our own _disconnect()
+        _LOGGER.debug("%s: disconnected", self.address)
+        self._client = None
+        self._last_tail_read_at = None
+        if self._tail_read_task is not None:
+            self._tail_read_task.cancel()
+        if self._bio_read_task is not None:
+            self._bio_read_task.cancel()
+        self._connect_wakeup.set()
+        self._fail_pending(BedJetConnectionError(f"{self.address}: disconnected"))
         self._fire_callbacks()
 
-    def _parse_bio_data_response(self, data: bytearray) -> None:
-        """Parse bio data responses."""
-        bio_type = data[0:1].hex()
-        tag = data[1:2].hex()
-        message = "Unknown bio data"
-
-        def parse_text(
-            data: bytearray, length: int | None = None, lead_bits: int = 0
-        ) -> str | list[str | list | None] | None:
-            """Parse text from a byte array."""
-            if lead_bits:
-                data = data[lead_bits:]
-            if not length:
-                if data[0] == 0:
-                    return "Default"
-                if data[0] == 1:
-                    return None
-                return data.split(b"\x00", 1)[0].decode()
-            else:
-                count = range(ceil(len(data) / length))
-                return [parse_text(data[i * length : (i + 1) * length]) for i in count]
-
-        if bio_type == "00":
-            message = "Device name"
-            self._name = parse_text(data, lead_bits=2)
-        elif bio_type == "01":
-            message = "Memory names"
-            self._memory_names = parse_text(data, 16, 2)
-        elif bio_type == "04":
-            message = "Biorhythm names"
-            self._biorhythm_names = parse_text(data, 16, 2)
-        elif bio_type == "20":
-            message = "Firmware"
-            firmwares = parse_text(data, 16, 2)
-            self._firmware_version = firmwares[0]
-
-        _LOGGER.debug(
-            "%s: %s (%s) received: %s (%s)",
-            self.name_and_address,
-            message,
-            tag,
-            data.hex(),
-            data,
-        )
-
-    def _reset_disconnect_timer(self) -> None:
-        """Reset disconnect timer."""
-        if self._auto_disconnect_timer:
-            self._auto_disconnect_timer.cancel()
-        self._expected_disconnect = False
-        self._auto_disconnect_timer = self.loop.call_later(
-            DISCONNECT_DELAY, self._auto_disconnect
-        )
-
-    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
-        """Disconnected callback."""
-        if self._expected_disconnect:
-            _LOGGER.debug("%s: Disconnected from device", self.name_and_address)
+    async def _disconnect(self) -> None:
+        client, self._client = self._client, None
+        if client is None:
             return
-        _LOGGER.warning("%s: Device unexpectedly disconnected", self.name_and_address)
-
-    def _auto_disconnect(self) -> None:
-        """Disconnect from device automatically."""
-        self._auto_disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
-
-    async def _execute_timed_disconnect(self) -> None:
-        """Execute timed disconnection."""
-        _LOGGER.debug(
-            "%s: Disconnecting after timeout of %s",
-            self.name_and_address,
-            DISCONNECT_DELAY,
-        )
-        await self._execute_disconnect()
-
-    async def _execute_disconnect(self) -> None:
-        """Execute disconnection."""
-        if self._auto_disconnect_timer:
-            self._auto_disconnect_timer.cancel()
-        async with self._connect_lock:
-            client = self._client
-            self._expected_disconnect = True
-            self._client = None
-            if client and client.is_connected:
-                try:
-                    uuid = BEDJET2_STATUS_UUID if self._is_v2 else BEDJET3_STATUS_UUID
-                    await client.stop_notify(uuid)
-                except BleakError:
-                    _LOGGER.debug(
-                        "%s: Failed to stop notifications",
-                        self.name_and_address,
-                        exc_info=True,
-                    )
+        _LOGGER.debug("%s: disconnecting", self.address)
+        self._last_tail_read_at = None
+        if self._tail_read_task is not None:
+            self._tail_read_task.cancel()
+        if self._bio_read_task is not None:
+            self._bio_read_task.cancel()
+        if client.is_connected:
+            with contextlib.suppress(BleakError, OSError, EOFError):
+                await client.stop_notify(STATUS_UUID)
+            with contextlib.suppress(BleakError, OSError, EOFError):
                 await client.disconnect()
+        self._fail_pending(BedJetConnectionError(f"{self.address}: disconnected"))
+        self._fire_callbacks()
 
-    async def _read_device_name(self) -> None:
-        """Read device name (BedJet 3 only)."""
-        if self._client and self._client.is_connected:
-            _LOGGER.debug("%s: Read device name", self.name_and_address)
-            data = await self._client.read_gatt_char(BEDJET3_NAME_UUID)
-            if (name := data.decode()) != self.name:
-                _LOGGER.debug(
-                    "%s: Actual device name is %s", self.name_and_address, name
-                )
-                self._name = name
+    # -- notifications / tail --------------------------------------------
 
-    async def _read_device_status(self) -> None:
-        """Read device status."""
-        if self._client and self._client.is_connected:
-            _LOGGER.debug("%s: Read device status", self.name_and_address)
-            data = await self._client.read_gatt_char(BEDJET3_STATUS_UUID)
-            self._last_update = datetime.now(UTC)
+    def _handle_notify(self, _char: BleakGATTCharacteristic, data: bytearray) -> None:
+        """bleak's notify callback - always sync; schedules the tail read as a tracked task."""
+        try:
+            new_state = decode_frame(bytes(data), self._state)
+        except BedJetFrameError as err:
+            _LOGGER.debug("%s: rejected frame %s: %s", self.address, bytes(data).hex(), err)
+            return
 
-            if len(data) != BEDJET3_STATUS_LENGTH:
-                _LOGGER.debug(
-                    "%s: Unexpected device status received: %s",
-                    self.name_and_address,
-                    data.hex(),
-                )
-                return
+        now = _monotonic()
+        previous = self._state
+        self._state = new_state
+        self._last_frame_at = now
+        self._resolve_pending(new_state)
 
-            _LOGGER.debug(
-                "%s: Received device status: %s", self.name_and_address, data.hex()
-            )
-            if (old_data := self._device_status_data) != data:
-                _LOGGER.debug(
-                    "%s: Device status updated: %s -> %s",
-                    self.name_and_address,
-                    old_data.hex() if old_data else None,
-                    data.hex(),
-                )
-                self._device_status_data = data
-                # _ = data[0]  # unknown
-                # _ = data[1]  # unknown
-                _, _, _, _, _, _, self._dual_zone, _ = [
-                    bool(data[2] >> x & 1) for x in range(7, -1, -1)
-                ]
-                # _ = data[3]  # unknown
-                # _ = data[4]  # unknown
-                # _ = data[5]  # unknown
-                self._update_phase = data[6]
-                (
-                    _,
-                    _,
-                    self._connection_test_passed,
-                    self._led_enabled,
-                    _,
-                    self._units_setup,
-                    _,
-                    self._beeps_muted,
-                ) = [bool(data[7] >> x & 1) for x in range(7, -1, -1)]
-                self._bio_sequence_step = data[8]
-                self._notification = BedJetNotification(data[9])
-                # _ = data[10]  # unknown
+        if new_state.is_partial and (
+            self._tail_refresh_needed
+            or self._last_tail_read_at is None
+            or now - self._last_tail_read_at >= TAIL_MAX_AGE_S
+        ):
+            self._schedule_tail_read()
 
-                self._fire_callbacks()
+        self._maybe_publish(previous, new_state, now)
 
-    async def _read_device_firmware(self) -> None:
-        """Read device firmware."""
-        tag = 0
-        while not self._firmware_version and tag < 2:
-            if self._client and self._client.is_connected:
-                _LOGGER.debug("%s: Read device firmware", self.name_and_address)
-                command = bytearray(
-                    (BedJetCommand.GET_BIO, BioDataRequest.FIRMWARE_VERSIONS, tag)
-                )
-                await self._send_command(command)
-                data = await self._client.read_gatt_char(BEDJET3_BIODATA_FULL_UUID)
-                self._parse_bio_data_response(data)
-                tag += 1
-        if not self._firmware_version:
-            _LOGGER.debug("%s: Failed to read firmware", self.name_and_address)
+    def _maybe_publish(self, previous: BedJetState | None, current: BedJetState, now: float) -> None:
+        meaningful = is_meaningful_change(previous, current)
+        stale = self._last_published_at is None or now - self._last_published_at >= PUBLISH_MIN_INTERVAL_S
+        if meaningful or stale:
+            self._last_published_at = now
+            self._fire_callbacks()
 
-    async def _read_biorhythm_names(self) -> None:
-        """Read biorhythm preset names."""
-        tag = 0
-        while not self._biorhythm_names and tag < 2:
-            if self._client and self._client.is_connected:
-                _LOGGER.debug("%s: Read biorhythm names", self.name_and_address)
-                command = bytearray(
-                    (BedJetCommand.GET_BIO, BioDataRequest.BIORHYTHM_NAMES, tag)
-                )
-                await self._send_command(command)
-                data = await self._client.read_gatt_char(BEDJET3_BIODATA_FULL_UUID)
-                self._parse_bio_data_response(data)
-                tag += 1
-        if not self._biorhythm_names:
-            _LOGGER.debug("%s: Failed to read biorhythm names", self.name_and_address)
+    def _schedule_tail_read(self) -> None:
+        if self._tail_read_task is not None and not self._tail_read_task.done():
+            return  # already in flight; it will pick up any newer command's effect too
+        self._tail_refresh_needed = False
+        self._tail_read_task = asyncio.create_task(self._read_tail())
+
+    async def _read_tail(self) -> None:
+        client = self._client
+        if client is None or not client.is_connected:
+            return
+        try:
+            data = await client.read_gatt_char(STATUS_UUID)
+        except (BleakError, OSError, EOFError) as err:
+            _LOGGER.debug("%s: tail read failed: %s", self.address, err)
+            return
+        self._last_tail_read_at = _monotonic()
+        if self._state is None:
+            return
+        try:
+            new_state = merge_tail(self._state, bytes(data))
+        except BedJetFrameError as err:
+            _LOGGER.debug("%s: rejected tail %s: %s", self.address, bytes(data).hex(), err)
+            return
+        previous = self._state
+        self._state = new_state
+        self._resolve_pending(new_state)
+        self._maybe_publish(previous, new_state, _monotonic())
+
+    # -- watchdog ---------------------------------------------------------
+
+    async def _watchdog_loop(self) -> None:
+        """Periodic tick; never raises. See `watchdog_action` for the pure tier decision."""
+        while not self._stopped:
+            try:
+                await asyncio.sleep(WATCHDOG_TICK_S)
+                if not self.connected or self._last_frame_at is None:
+                    continue
+                elapsed = _monotonic() - self._last_frame_at
+                action = watchdog_action(elapsed)
+                if action is WatchdogAction.NONE:
+                    continue
+                if action is WatchdogAction.PROBE:
+                    # Fire-and-forget: a confirmed request_status() would block
+                    # this loop for up to COMMAND_TIMEOUT_S waiting for a frame
+                    # that, by definition, is not arriving - the escalation to
+                    # UNAVAILABLE/RECONNECT must not be delayed by that wait.
+                    # If the probe *does* wake the device, the ordinary notify
+                    # path updates last_frame_at on its own; nothing here needs
+                    # to observe that outcome. The public `request_status()`
+                    # stays a normal confirmed command for callers that want one.
+                    _LOGGER.debug("%s: no frame for %.0fs, probing", self.address, elapsed)
+                    await self._write_raw_command(build_command(BedJetCommand.STATUS))
+                elif action is WatchdogAction.UNAVAILABLE:
+                    if self._last_unavailable_notice_at != self._last_frame_at:
+                        self._last_unavailable_notice_at = self._last_frame_at
+                        _LOGGER.warning("%s: no frame for %.0fs, marking unavailable", self.address, elapsed)
+                        self._fire_callbacks()
+                elif action is WatchdogAction.RECONNECT:
+                    _LOGGER.warning("%s: no frame for %.0fs, forcing reconnect", self.address, elapsed)
+                    await self._disconnect()
+                    self._connect_wakeup.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("unexpected error in BedJet watchdog loop")
+
+    async def _write_raw_command(self, command_bytes: bytes) -> None:
+        """Best-effort write with no confirmation. Used only by the watchdog probe."""
+        client = self._client
+        if client is None or not client.is_connected:
+            return
+        with contextlib.suppress(BleakError, OSError, EOFError):
+            await client.write_gatt_char(COMMAND_UUID, command_bytes, response=False)
+
+    # -- best-effort bio-data (memory preset names) ----------------------
+
+    def _start_bio_read(self) -> None:
+        if self._bio_read_task is not None and not self._bio_read_task.done():
+            return
+        self._bio_read_task = asyncio.create_task(self._read_memory_names())
 
     async def _read_memory_names(self) -> None:
-        """Read memory preset names."""
-        tag = 0
-        while not self._memory_names and tag < 2:
-            if self._client and self._client.is_connected:
-                _LOGGER.debug("%s: Read memory names", self.name_and_address)
-                command = bytearray(
-                    (BedJetCommand.GET_BIO, BioDataRequest.MEMORY_NAMES, tag)
-                )
-                await self._send_command(command)
-                data = await self._client.read_gatt_char(BEDJET3_BIODATA_FULL_UUID)
-                self._parse_bio_data_response(data)
-                tag += 1
-        if not self._memory_names:
-            _LOGGER.debug("%s: Failed to read memory names", self.name_and_address)
+        """Best-effort, non-fatal read of the M1/M2/M3 preset names.
 
-    async def _send_command(self, command: bytearray) -> None:
-        """Send a command to the BedJet."""
-        if self._client and self._client.is_connected:
-            _LOGGER.debug(
-                "%s: Sending command: %s", self.name_and_address, command.hex()
-            )
-
-            if self._is_v2:
-                # WRAPPER: 0x58 + CMD + CHECKSUM
-                v2_payload = bytearray([0x58]) + command
-                total = sum(v2_payload) & 0xFF
-                checksum = (0xFF - total) & 0xFF
-                v2_payload.append(checksum)
-                # Send V2 Packet
-                await self._client.write_gatt_char(
-                    BEDJET2_COMMAND_UUID, v2_payload, response=False
+        [INFERENCE] Entirely absent from ESPHome; kept per the assignment's
+        explicit carve-out (knowledge ESPHome lacks). Any failure here is
+        logged at debug and never surfaces to a caller or affects `state`.
+        """
+        for attempt in range(BIO_READ_ATTEMPTS):
+            client = self._client
+            if client is None or not client.is_connected:
+                return
+            try:
+                await client.write_gatt_char(
+                    COMMAND_UUID,
+                    build_command(BedJetCommand.GET_BIO, BioDataRequest.MEMORY_NAMES, attempt),
+                    response=False,
                 )
-            else:
-                # Original V3 Command
-                await self._client.write_gatt_char(BEDJET3_COMMAND_UUID, command)
-
-    async def _run_test_commands(self) -> None:
-        """Run test commands (BedJet 3 only)."""
-        if self._client and self._client.is_connected and not self._is_v2:
-            tag = 0
-            for bio_type in (
-                BioDataRequest.BIORHYTHM_NAMES,
-                BioDataRequest.DEVICE_NAME,
-                BioDataRequest.FIRMWARE_VERSIONS,
-                BioDataRequest.MEMORY_NAMES,
-            ):
-                tag += 1
-                command = bytearray((BedJetCommand.GET_BIO, bio_type, tag))
-                _LOGGER.debug(
-                    "%s: Writing command value: %s",
-                    self.name_and_address,
-                    command.hex(),
-                )
-                await self._client.write_gatt_char(BEDJET3_COMMAND_UUID, command, True)
-
-                data = await self._client.read_gatt_char(BEDJET3_BIODATA_FULL_UUID)
-                self._parse_bio_data_response(data)
-                _LOGGER.debug(
-                    "%s: %s/%s, %s/%s, %s, %s",
-                    self.name_and_address,
-                    bio_type,
-                    data[0],
-                    tag,
-                    data[1],
-                    data[2:].hex(),
-                    data[2:],
-                )
+                data = await client.read_gatt_char(BIODATA_FULL_UUID)
+            except (BleakError, OSError, EOFError) as err:
+                _LOGGER.debug("%s: memory-name read attempt %d failed: %s", self.address, attempt, err)
+                continue
+            names = _parse_memory_names(bytes(data))
+            if names is not None:
+                self._m1_name, self._m2_name, self._m3_name = names
+                return
+        _LOGGER.debug("%s: could not read memory preset names", self.address)

@@ -1,4 +1,4 @@
-"""BedJet binary sensor entity."""
+"""BedJet binary sensor entities."""
 
 from __future__ import annotations
 
@@ -14,18 +14,17 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from . import BedJetConfigEntry
 from .entity import BedJetEntity
-from .pybedjet import BedJet
+from .pybedjet import BedJetState
 
 
 @dataclass(frozen=True, kw_only=True)
 class BedJetBinarySensorEntityDescription(BinarySensorEntityDescription):
     """BedJet binary sensor entity description."""
 
-    value_fn: Callable[[BedJet], Any]
+    value_fn: Callable[[BedJetState], Any]
 
 
 SENSORS = (
@@ -34,21 +33,22 @@ SENSORS = (
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
-        value_fn=lambda device: device.connection_test_passed,
+        translation_key="connection_test",
+        value_fn=lambda state: state.connection_test_passed,
     ),
     BedJetBinarySensorEntityDescription(
         key="dual_zone",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         translation_key="dual_zone",
-        value_fn=lambda device: device.dual_zone,
+        value_fn=lambda state: state.dual_zone,
     ),
     BedJetBinarySensorEntityDescription(
         key="units_setup",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         translation_key="units_setup",
-        value_fn=lambda device: device.units_setup,
+        value_fn=lambda state: state.units_setup,
     ),
 )
 
@@ -59,31 +59,27 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the binary sensor platform for BedJet."""
-    data = entry.runtime_data
+    coordinator = entry.runtime_data
     async_add_entities(
-        BedJetBinarySensorEntity(data.coordinator, data.device, entry.title, descriptor)
+        BedJetBinarySensorEntity(coordinator, entry.title, descriptor)
         for descriptor in SENSORS
     )
 
 
 class BedJetBinarySensorEntity(BedJetEntity, BinarySensorEntity):
-    """Representation of BedJet device."""
+    """Representation of a BedJet binary sensor."""
 
     entity_description: BedJetBinarySensorEntityDescription
 
-    def __init__(
-        self,
-        coordinator: DataUpdateCoordinator[None],
-        device: BedJet,
-        name: str,
-        entity_description: BedJetBinarySensorEntityDescription,
-    ) -> None:
+    def __init__(self, coordinator, name: str, entity_description) -> None:
         """Initialize a BedJet binary sensor entity."""
         self.entity_description = entity_description
-        self._attr_unique_id = f"{device.address}_{entity_description.key}"
-        super().__init__(coordinator, device, name)
+        self._attr_unique_id = f"{coordinator.device.address}_{entity_description.key}"
+        super().__init__(coordinator, name)
 
     @callback
     def _async_update_attrs(self) -> None:
         """Handle updating _attr values."""
-        self._attr_is_on = self.entity_description.value_fn(self._device)
+        if (state := self.coordinator.data) is None:
+            return
+        self._attr_is_on = self.entity_description.value_fn(state)

@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
-from datetime import timedelta
 import logging
-
-from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
@@ -15,9 +10,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
-from .const import DEVICE_TIMEOUT, UPDATE_SECONDS
+from .coordinator import BedJetCoordinator
 from .pybedjet import BedJet
 
 PLATFORMS: list[Platform] = [
@@ -32,38 +27,52 @@ PLATFORMS: list[Platform] = [
 
 _LOGGER = logging.getLogger(__name__)
 
-
-@dataclass
-class BedJetData:
-    """Data for the BedJet integration."""
-
-    title: str
-    device: BedJet
-    coordinator: DataUpdateCoordinator[None]
-
-
-type BedJetConfigEntry = ConfigEntry[BedJetData]
+type BedJetConfigEntry = ConfigEntry[BedJetCoordinator]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bool:
-    """Set up BedJet from a config entry."""
+    """Set up BedJet from a config entry.
+
+    Setup never blocks on the device actually answering: the BedJet only
+    accepts one BLE connection at a time, so it may be legitimately busy
+    (held by the phone app) for as long as a user wants. If setup instead
+    waited for a first status frame, the config entry - and with it the
+    always-available Bluetooth Connection switch a user needs to reclaim the
+    slot - would never even be created while the app has it. Every entity
+    besides that switch simply reports unavailable until the coordinator
+    receives its first pushed frame.
+
+    ConfigEntryNotReady is only raised for the one case more waiting cannot
+    fix: this address has never been seen by Home Assistant's Bluetooth
+    stack at all, so there is no BLEDevice to connect to yet.
+    """
     address: str = entry.data[CONF_ADDRESS]
-    ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
-    if not ble_device:
+    service_info = bluetooth.async_last_service_info(hass, address, connectable=True)
+    if service_info is None:
         raise ConfigEntryNotReady(
-            f"Could not find BedJet device with address {address}"
+            f"BedJet {address} has not been seen by Bluetooth yet"
         )
 
-    bedjet = BedJet(ble_device)
+    device = BedJet(
+        service_info.device,
+        service_info.advertisement,
+        source=service_info.source,
+        clock=dt_util.now,
+    )
 
     @callback
     def _async_update_ble(
         service_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """Update from a ble callback."""
-        bedjet.set_ble_device_and_advertisement_data(
-            service_info.device, service_info.advertisement
+        """Feed every advertisement seen for this address to the library.
+
+        The BedJet only advertises while nothing is connected to it, so an
+        advertisement is how the library learns the phone app (or a previous
+        Home Assistant connection) released the single connection slot.
+        """
+        device.set_ble_device_and_advertisement_data(
+            service_info.device, service_info.advertisement, source=service_info.source
         )
 
     entry.async_on_unload(
@@ -75,54 +84,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
         )
     )
 
-    async def _async_update() -> None:
-        """Update the device state."""
-        try:
-            await bedjet.update()
-        except BLEAK_EXCEPTIONS as ex:
-            if bedjet.is_data_stale:
-                raise UpdateFailed(str(ex)) from ex
-            _LOGGER.debug(
-                "%s: Update failed but data is fresh, ignoring: %s",
-                bedjet.name_and_address,
-                ex,
-            )
+    coordinator = BedJetCoordinator(hass, entry, device)
+    entry.runtime_data = coordinator
 
-    startup_event = asyncio.Event()
-    cancel_first_update = bedjet.register_callback(lambda *_: startup_event.set())
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        config_entry=entry,
-        name=f"{entry.title} ({entry.unique_id})",
-        update_method=_async_update,
-        update_interval=timedelta(seconds=UPDATE_SECONDS),
-    )
-
-    try:
-        await coordinator.async_config_entry_first_refresh()
-    except ConfigEntryNotReady:
-        cancel_first_update()
-        raise
-
-    try:
-        async with asyncio.timeout(DEVICE_TIMEOUT):
-            await startup_event.wait()
-    except TimeoutError as ex:
-        raise ConfigEntryNotReady(
-            "Unable to communicate with the device; "
-            f"Try moving the Bluetooth adapter closer to {bedjet.name_and_address}"
-        ) from ex
-    finally:
-        cancel_first_update()
-
-    entry.runtime_data = BedJetData(entry.title, bedjet, coordinator)
+    # Kicks off the hold_connection maintain-and-reconnect loop; does not
+    # wait for a connection to actually succeed.
+    await device.start()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def _async_stop(event: Event) -> None:
-        """Close the connection."""
-        await bedjet.disconnect()
+        """Release the BLE connection on Home Assistant stop."""
+        await device.stop()
 
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop)
@@ -132,5 +105,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
 
 async def async_unload_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bool:
     """Unload a config entry."""
-    await entry.runtime_data.device.disconnect()
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        await entry.runtime_data.device.stop()
+    return unload_ok

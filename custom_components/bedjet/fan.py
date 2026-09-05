@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from homeassistant.components.fan import FanEntity, FanEntityFeature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from . import BedJetConfigEntry
 from .entity import BedJetEntity
-from .pybedjet import BedJet, OperatingMode
-
-_LOGGER = logging.getLogger(__name__)
+from .pybedjet import BedJetMode
 
 
 async def async_setup_entry(
@@ -23,12 +19,12 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the fan platform for BedJet."""
-    data = entry.runtime_data
-    async_add_entities([BedJetFanEntity(data.coordinator, data.device, entry.title)])
+    coordinator = entry.runtime_data
+    async_add_entities([BedJetFanEntity(coordinator, entry.title)])
 
 
 class BedJetFanEntity(BedJetEntity, FanEntity):
-    """Representation of BedJet device."""
+    """Representation of a BedJet device as a fan entity."""
 
     _attr_name = None
     _attr_speed_count = 20
@@ -38,31 +34,23 @@ class BedJetFanEntity(BedJetEntity, FanEntity):
         | FanEntityFeature.TURN_ON
     )
 
-    def __init__(
-        self, coordinator: DataUpdateCoordinator[None], device: BedJet, name: str
-    ) -> None:
+    def __init__(self, coordinator, name: str) -> None:
         """Initialize a BedJet fan entity."""
-        self._attr_unique_id = f"{device.address}_fan"
-        super().__init__(coordinator, device, name)
+        self._attr_unique_id = f"{coordinator.device.address}_fan"
+        super().__init__(coordinator, name)
 
     @callback
     def _async_update_attrs(self) -> None:
         """Handle updating _attr values."""
-        device = self._device
-        state = device.state
-        is_on = state.operating_mode != OperatingMode.STANDBY
+        if (state := self.coordinator.data) is None:
+            return
+        is_on = state.mode != BedJetMode.STANDBY
         self._attr_is_on = is_on
-        self._attr_percentage = state.fan_speed if is_on else 0
-
-    async def async_set_percentage(self, percentage: int) -> None:
-        """Set the speed of the fan, as a percentage."""
-        if percentage == 0:
-            return await self.async_turn_off()
-        await self.async_turn_on(percentage=percentage)
+        self._attr_percentage = state.fan_percent if is_on else 0
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the fan."""
-        await self._device.set_operating_mode(OperatingMode.STANDBY)
+        await self._async_send_command(self._device.set_mode, BedJetMode.STANDBY)
 
     async def async_turn_on(
         self,
@@ -71,7 +59,14 @@ class BedJetFanEntity(BedJetEntity, FanEntity):
         **kwargs: Any,
     ) -> None:
         """Turn on the fan."""
-        if self._device.state.operating_mode == OperatingMode.STANDBY:
-            await self._device.set_operating_mode(OperatingMode.COOL)
+        if self.coordinator.data is None or self.coordinator.data.mode == BedJetMode.STANDBY:
+            await self._async_send_command(self._device.set_mode, BedJetMode.COOL)
         if percentage:
-            await self._device.set_fan_speed(percentage)
+            await self._async_send_command(self._device.set_fan_percent, percentage)
+
+    async def async_set_percentage(self, percentage: int) -> None:
+        """Set the speed of the fan, as a percentage."""
+        if percentage == 0:
+            await self.async_turn_off()
+            return
+        await self.async_turn_on(percentage=percentage)

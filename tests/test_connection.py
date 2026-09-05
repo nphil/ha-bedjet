@@ -1,0 +1,492 @@
+"""Tests for pybedjet.BedJet's connection lifecycle: hold_connection
+semantics, reconnect-on-advertisement, command confirmation/timeout, the
+watchdog's three tiers, tail-read staleness gating, and listener fan-out
+rate limiting.
+
+Real time is never slept: `establish_connection`/`BleakClient` are replaced
+with `tests.ble_fakes`, `_monotonic` is monkeypatched to a controllable fake
+clock, and short real-world constants (`COMMAND_TIMEOUT_S`,
+`reconnect_backoff_seconds`) are patched to tiny values so a test only waits
+on genuinely-pending asyncio tasks, never a real multi-second/minute delay.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+import custom_components.bedjet.pybedjet as pb
+from custom_components.bedjet.pybedjet import (
+    BedJet,
+    BedJetCommandError,
+    BedJetConnectionError,
+)
+from custom_components.bedjet.pybedjet.const import BedJetMode
+from tests.ble_fakes import (
+    BEDJET_COMMAND_UUID,
+    BEDJET_STATUS_UUID,
+    FakeBleakClient,
+    FakeBleakClientFactory,
+    make_advertisement_data,
+    make_ble_device,
+    make_fake_establish_connection,
+)
+from tests.conftest import build_notify_frame, build_tail
+
+
+class FakeClock:
+    """Controllable stand-in for time.monotonic, advanced explicitly by tests."""
+
+    def __init__(self, t: float = 1_000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+async def _pump(times: int = 5) -> None:
+    """Let pending asyncio tasks (create_task callbacks) make progress."""
+    for _ in range(times):
+        await asyncio.sleep(0)
+
+
+@pytest.fixture(autouse=True)
+def _reset_fake_bleak_client():
+    FakeBleakClient.fail_next_connects = 0
+    yield
+    FakeBleakClient.fail_next_connects = 0
+
+
+@pytest.fixture
+def factory(monkeypatch) -> FakeBleakClientFactory:
+    factory = FakeBleakClientFactory()
+    monkeypatch.setattr(pb, "establish_connection", make_fake_establish_connection(factory))
+    return factory
+
+
+@pytest.fixture
+def clock(monkeypatch) -> FakeClock:
+    clock = FakeClock()
+    monkeypatch.setattr(pb, "_monotonic", clock)
+    return clock
+
+
+@pytest.fixture
+def fast_backoff(monkeypatch):
+    """Backoff delay small enough that a real await resolves near-instantly."""
+    monkeypatch.setattr(pb, "reconnect_backoff_seconds", lambda attempt, rng=None: 0.01)
+
+
+@pytest.fixture
+def fast_command_timeout(monkeypatch):
+    monkeypatch.setattr(pb, "COMMAND_TIMEOUT_S", 0.05)
+
+
+def make_bedjet(*, hold_connection: bool = True) -> BedJet:
+    return BedJet(
+        make_ble_device(),
+        make_advertisement_data(),
+        hold_connection=hold_connection,
+    )
+
+
+class TestHoldConnection:
+    def test_false_at_start_never_connects(self, factory, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=False)
+            await bedjet.start()
+            await _pump()
+            assert factory.clients == []
+            assert bedjet.connected is False
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_setting_true_connects(self, factory, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=False)
+            await bedjet.start()
+            await _pump()
+            assert factory.clients == []
+
+            bedjet.hold_connection = True
+            await _pump()
+
+            assert bedjet.connected is True
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_setting_false_while_connected_disconnects(self, factory, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            assert bedjet.connected is True
+            client = factory.last
+
+            bedjet.hold_connection = False
+            await _pump()
+
+            assert client.disconnect_calls == 1
+            assert bedjet.connected is False
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_false_suppresses_reconnect_even_on_advertisement(self, factory, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            assert len(factory.clients) == 1
+
+            bedjet.hold_connection = False
+            await _pump()
+
+            bedjet.set_ble_device_and_advertisement_data(
+                make_ble_device(), make_advertisement_data()
+            )
+            await _pump()
+
+            # No new client: the slot stays released until hold_connection
+            # is turned back on.
+            assert len(factory.clients) == 1
+            assert bedjet.connected is False
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+
+class TestReconnectOnAdvertisement:
+    def test_advertisement_wakes_a_pending_backoff_immediately(self, factory, monkeypatch) -> None:
+        async def scenario() -> None:
+            # A long backoff so a "did it wake early" assertion is meaningful.
+            monkeypatch_backoff_calls: list[int] = []
+
+            def slow_backoff(attempt: int, rng=None) -> float:
+                monkeypatch_backoff_calls.append(attempt)
+                return 10.0  # would never resolve within this test's timeout
+
+            monkeypatch.setattr(pb, "reconnect_backoff_seconds", slow_backoff)
+
+            FakeBleakClient.fail_next_connects = 4  # exhaust establish_connection's retries
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            assert bedjet.connected is False
+            assert monkeypatch_backoff_calls == [0]  # first failure recorded
+
+            # Supervisor is now asleep waiting up to 10s for a wakeup. An
+            # advertisement must interrupt that wait immediately.
+            bedjet.set_ble_device_and_advertisement_data(
+                make_ble_device(), make_advertisement_data()
+            )
+            await asyncio.wait_for(_pump(20), timeout=1.0)
+
+            assert bedjet.connected is True
+            assert len(factory.clients) > 1  # a genuine second attempt happened
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_disconnect_triggers_exactly_one_reconnect(self, factory, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            assert len(factory.clients) == 1
+
+            factory.last.simulate_disconnect()
+            await asyncio.wait_for(_pump(20), timeout=1.0)
+
+            assert len(factory.clients) == 2
+            assert bedjet.connected is True
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+
+class TestReconnectBackoffIntegration:
+    def test_attempt_count_increments_then_resets_on_success(self, factory, monkeypatch) -> None:
+        async def scenario() -> None:
+            seen_attempts: list[int] = []
+
+            def recording_backoff(attempt: int, rng=None) -> float:
+                seen_attempts.append(attempt)
+                return 0.0  # expires immediately; no real wall-clock wait needed
+
+            monkeypatch.setattr(pb, "reconnect_backoff_seconds", recording_backoff)
+
+            FakeBleakClient.fail_next_connects = 12  # fail several full establish_connection calls
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            for _ in range(50):
+                await asyncio.sleep(0.005)
+                if len(seen_attempts) >= 3:
+                    break
+
+            assert seen_attempts == sorted(seen_attempts)  # non-decreasing
+            assert seen_attempts[0] == 0
+            assert len(seen_attempts) >= 2  # more than one failure was recorded
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+
+class TestCommandConfirmation:
+    def test_not_connected_raises_connection_error(self, factory) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=False)
+            with pytest.raises(BedJetConnectionError):
+                await bedjet.set_mode(BedJetMode.HEAT)
+
+        asyncio.run(scenario())
+
+    def test_matching_frame_resolves_the_command(self, factory) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            client = factory.last
+
+            task = asyncio.create_task(bedjet.set_mode(BedJetMode.HEAT))
+            await _pump()
+            assert client.writes[-1] == bytes([0x01, 0x03])  # BUTTON, HEAT
+
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(mode=int(BedJetMode.HEAT)))
+            await asyncio.wait_for(task, timeout=1.0)  # must not raise
+
+            assert bedjet.state.mode is BedJetMode.HEAT
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_non_matching_frames_do_not_resolve_and_it_times_out(
+        self, factory, fast_command_timeout
+    ) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            client = factory.last
+
+            task = asyncio.create_task(bedjet.set_mode(BedJetMode.HEAT))
+            await _pump()
+            # Frames confirming a different mode must not resolve this command.
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(mode=int(BedJetMode.COOL)))
+            await _pump()
+
+            with pytest.raises(BedJetCommandError):
+                await asyncio.wait_for(task, timeout=1.0)
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+
+class TestTailReadGating(object):
+    def test_partial_frame_triggers_one_tail_read_not_per_frame(self, factory, clock) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            client = factory.last
+            client.set_read_value(BEDJET_STATUS_UUID, build_tail())
+
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame())
+            await _pump()
+            assert client.reads.count(BEDJET_STATUS_UUID) == 1
+
+            # A second is_partial frame shortly after (well within
+            # TAIL_MAX_AGE_S) with nothing stale/pending must not re-read.
+            clock.advance(1.0)
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(fan_step=0))
+            await _pump()
+            assert client.reads.count(BEDJET_STATUS_UUID) == 1
+
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_stale_tail_is_re_read_after_max_age(self, factory, clock) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            client = factory.last
+            client.set_read_value(BEDJET_STATUS_UUID, build_tail())
+
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame())
+            await _pump()
+            assert client.reads.count(BEDJET_STATUS_UUID) == 1
+
+            clock.advance(pb.TAIL_MAX_AGE_S + 1.0)
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame())
+            await _pump()
+
+            assert client.reads.count(BEDJET_STATUS_UUID) == 2
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_command_completion_forces_a_tail_re_read(self, factory, clock) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            client = factory.last
+            client.set_read_value(BEDJET_STATUS_UUID, build_tail())
+
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame())
+            await _pump()
+            assert client.reads.count(BEDJET_STATUS_UUID) == 1
+
+            # Barely any time passes (not stale), but a command just wrote -
+            # the next partial frame must still trigger a fresh tail read.
+            clock.advance(0.5)
+            task = asyncio.create_task(bedjet.set_mode(BedJetMode.HEAT))
+            await _pump()
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(mode=int(BedJetMode.HEAT)))
+            await asyncio.wait_for(task, timeout=1.0)
+            await _pump()
+
+            assert client.reads.count(BEDJET_STATUS_UUID) == 2
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+
+class TestListenerFanOutRateLimit:
+    def test_continuous_only_change_is_rate_limited(self, factory, clock) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            events: list[int] = []
+            bedjet.register_callback(lambda _d: events.append(1))
+
+            await bedjet.start()
+            await _pump()
+            client = factory.last
+            # Establish a baseline decoded state first: the very first frame
+            # is always "meaningful" (previous is None), which would
+            # otherwise make a bare actual-temp-only test frame publish
+            # immediately for the wrong reason.
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(actual_temp_step=50))
+            await _pump()
+            baseline = len(events)
+
+            clock.advance(0.5)  # well within PUBLISH_MIN_INTERVAL_S
+            client.notify(
+                BEDJET_STATUS_UUID, build_notify_frame(actual_temp_step=60)
+            )  # ambient/actual only
+            await _pump()
+            assert len(events) == baseline  # rate-limited, not fired
+
+            clock.advance(pb.PUBLISH_MIN_INTERVAL_S + 0.1)
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(actual_temp_step=62))
+            await _pump()
+            assert len(events) == baseline + 1  # now stale enough to publish
+
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_mode_change_publishes_immediately_despite_rate_limit(self, factory, clock) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            events: list[int] = []
+            bedjet.register_callback(lambda _d: events.append(1))
+
+            await bedjet.start()
+            await _pump()
+            client = factory.last
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(mode=int(BedJetMode.STANDBY)))
+            await _pump()
+            baseline = len(events)
+
+            clock.advance(0.1)  # nowhere near PUBLISH_MIN_INTERVAL_S; must publish anyway
+            client.notify(BEDJET_STATUS_UUID, build_notify_frame(mode=int(BedJetMode.HEAT)))
+            await _pump()
+
+            assert len(events) == baseline + 1
+
+
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+
+class TestWatchdog:
+    async def _connected_bedjet(self, factory):
+        bedjet = make_bedjet(hold_connection=True)
+        await bedjet.start()
+        await _pump(20)  # let the background bio-name read task finish too
+        return bedjet, factory.last
+
+    async def _run_one_tick(self, monkeypatch, bedjet) -> None:
+        """Run exactly one watchdog tick body by making the sleep a no-op
+        that stops the loop right after, instead of sleeping WATCHDOG_TICK_S.
+        """
+
+        async def fake_sleep(_seconds: float) -> None:
+            bedjet._stopped = True
+
+        monkeypatch.setattr(pb.asyncio, "sleep", fake_sleep)
+        await bedjet._watchdog_loop()
+
+    def test_below_probe_threshold_does_nothing(self, factory, clock, monkeypatch) -> None:
+        async def scenario() -> None:
+            bedjet, client = await self._connected_bedjet(factory)
+            writes_before = len(client.writes)
+            clock.advance(30.0)
+            await self._run_one_tick(monkeypatch, bedjet)
+            assert client.writes[writes_before:] == []
+
+        asyncio.run(scenario())
+
+    def test_probe_tier_sends_status_request(
+        self, factory, clock, monkeypatch, fast_command_timeout
+    ) -> None:
+        async def scenario() -> None:
+            bedjet, client = await self._connected_bedjet(factory)
+            clock.advance(pb.WATCHDOG_PROBE_AFTER_S + 1.0)
+            await self._run_one_tick(monkeypatch, bedjet)
+            assert client.writes[-1] == bytes([0x06])  # CMD_STATUS, no data
+
+        asyncio.run(scenario())
+
+    def test_unavailable_tier_fires_callback_once_per_stale_last_frame(
+        self, factory, clock, monkeypatch
+    ) -> None:
+        async def scenario() -> None:
+            bedjet, client = await self._connected_bedjet(factory)
+            events: list[int] = []
+            bedjet.register_callback(lambda _d: events.append(1))
+            before = len(events)
+
+            clock.advance(pb.STATUS_TIMEOUT_S + 1.0)
+            assert bedjet.available is False
+            await self._run_one_tick(monkeypatch, bedjet)
+            assert len(events) == before + 1
+
+            # Same stale last_frame_at again: must not re-notify.
+            bedjet._stopped = False
+            await self._run_one_tick(monkeypatch, bedjet)
+            assert len(events) == before + 1
+
+        asyncio.run(scenario())
+
+    def test_reconnect_tier_forces_disconnect(self, factory, clock, monkeypatch) -> None:
+        async def scenario() -> None:
+            bedjet, client = await self._connected_bedjet(factory)
+            clock.advance(pb.WATCHDOG_RECONNECT_AFTER_S + 1.0)
+            await self._run_one_tick(monkeypatch, bedjet)
+
+            assert client.disconnect_calls == 1
+            assert bedjet.connected is False
+            assert bedjet._connect_wakeup.is_set()
+
+        asyncio.run(scenario())

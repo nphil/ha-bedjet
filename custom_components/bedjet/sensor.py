@@ -1,4 +1,4 @@
-"""BedJet sensor entity."""
+"""BedJet sensor entities."""
 
 from __future__ import annotations
 
@@ -15,11 +15,10 @@ from homeassistant.components.sensor import (
 from homeassistant.const import EntityCategory, UnitOfTemperature, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from . import BedJetConfigEntry
 from .entity import BedJetEntity
-from .pybedjet import BedJet
+from .pybedjet import BedJet, BedJetNotification
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -34,50 +33,44 @@ SENSORS = (
         key="ambient_temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-        translation_key="ambient_temperature",
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda device: device.state.ambient_temperature,
+        translation_key="ambient_temperature",
+        value_fn=lambda device: device.state.ambient_temp_c,
+    ),
+    BedJetSensorEntityDescription(
+        key="outlet_temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        translation_key="outlet_temperature",
+        value_fn=lambda device: device.state.actual_temp_c,
+    ),
+    BedJetSensorEntityDescription(
+        key="notification",
+        device_class=SensorDeviceClass.ENUM,
+        options=[member.name.lower() for member in BedJetNotification],
+        translation_key="notification",
+        value_fn=(
+            lambda device: (
+                notification.name.lower()
+                if (notification := device.state.notification) is not None
+                else None
+            )
+        ),
     ),
     BedJetSensorEntityDescription(
         key="bio_sequence_step",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         translation_key="bio_sequence_step",
-        value_fn=lambda device: device.bio_sequence_step,
-    ),
-    BedJetSensorEntityDescription(
-        key="notification",
-        device_class=SensorDeviceClass.ENUM,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        options=[
-            "none",
-            "clean_filter",
-            "update_available",
-            "update_failed",
-            "bio_fail_clock_not_set",
-            "bio_fail_too_long",
-        ],
-        translation_key="notification",
-        value_fn=(
-            lambda device: (
-                notification.name.lower()
-                if (notification := device.notification)
-                else None
-            )
-        ),
-    ),
-    BedJetSensorEntityDescription(
-        key="run_end_time",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        translation_key="run_end_time",
-        value_fn=lambda device: device.state.run_end_time,
+        value_fn=lambda device: device.state.bio_sequence_step,
     ),
     BedJetSensorEntityDescription(
         key="shutdown_reason",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         translation_key="shutdown_reason",
-        value_fn=lambda device: device.shutdown_reason,
+        value_fn=lambda device: device.state.shutdown_reason,
     ),
     BedJetSensorEntityDescription(
         key="turbo_time",
@@ -85,16 +78,22 @@ SENSORS = (
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         native_unit_of_measurement=UnitOfTime.SECONDS,
-        suggested_unit_of_measurement=UnitOfTime.SECONDS,
         translation_key="turbo_time",
-        value_fn=lambda device: device.state.turbo_time.total_seconds(),
+        value_fn=lambda device: device.state.turbo_time,
     ),
     BedJetSensorEntityDescription(
         key="update_phase",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         translation_key="update_phase",
-        value_fn=lambda device: device.update_phase,
+        value_fn=lambda device: device.state.update_phase,
+    ),
+    BedJetSensorEntityDescription(
+        key="scanner",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        translation_key="scanner",
+        value_fn=lambda device: device.scanner_source,
     ),
 )
 
@@ -105,31 +104,27 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the sensor platform for BedJet."""
-    data = entry.runtime_data
+    coordinator = entry.runtime_data
     async_add_entities(
-        BedJetSensorEntity(data.coordinator, data.device, entry.title, descriptor)
+        BedJetSensorEntity(coordinator, entry.title, descriptor)
         for descriptor in SENSORS
     )
 
 
 class BedJetSensorEntity(BedJetEntity, SensorEntity):
-    """Representation of BedJet device."""
+    """Representation of a BedJet sensor."""
 
     entity_description: BedJetSensorEntityDescription
 
-    def __init__(
-        self,
-        coordinator: DataUpdateCoordinator[None],
-        device: BedJet,
-        name: str,
-        entity_description: BedJetSensorEntityDescription,
-    ) -> None:
+    def __init__(self, coordinator, name: str, entity_description) -> None:
         """Initialize a BedJet sensor entity."""
         self.entity_description = entity_description
-        self._attr_unique_id = f"{device.address}_{entity_description.key}"
-        super().__init__(coordinator, device, name)
+        self._attr_unique_id = f"{coordinator.device.address}_{entity_description.key}"
+        super().__init__(coordinator, name)
 
     @callback
     def _async_update_attrs(self) -> None:
         """Handle updating _attr values."""
+        if self.entity_description.key != "scanner" and self.coordinator.data is None:
+            return
         self._attr_native_value = self.entity_description.value_fn(self._device)

@@ -1,12 +1,11 @@
-"""Config flow for BedJet integration."""
+"""Config flow for the BedJet integration."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
-from bleak.backends.device import BLEDevice
-from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
 from bluetooth_data_tools import human_readable_name
 import voluptuous as vol
 
@@ -17,27 +16,47 @@ from homeassistant.components.bluetooth import (
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS
 
-from .const import DOMAIN
-from .pybedjet import BEDJET3_SERVICE_UUID, BedJet
+from .const import BEDJET_SERVICE_UUID, DOMAIN, LOCAL_NAME_PREFIX
+from .pybedjet import BedJet
 
 _LOGGER = logging.getLogger(__name__)
 
-LOCAL_NAME = "BEDJET"
+# Short interactive timeout for the config flow's connectivity probe; the
+# longer CONNECT_TIMEOUT in const.py is for the (non-interactive) integration
+# setup, which HA retries automatically on failure.
+PROBE_TIMEOUT = 15
 
 
-async def connect_bedjet(device: BLEDevice) -> tuple[bool, str]:
-    """Connect to a BedJet and return return status and success or error."""
-    bedjet = BedJet(device)
+def _is_bedjet(service_info: BluetoothServiceInfoBleak) -> bool:
+    """Return True if a discovered advertisement looks like a BedJet."""
+    return BEDJET_SERVICE_UUID in service_info.service_uuids or bool(
+        service_info.name and service_info.name.upper().startswith(LOCAL_NAME_PREFIX)
+    )
+
+
+async def _async_probe(service_info: BluetoothServiceInfoBleak) -> str | None:
+    """Connect briefly to confirm a BedJet answers.
+
+    Returns an abort/error reason string on failure, or None on success.
+    """
+    device = BedJet(
+        service_info.device, service_info.advertisement, source=service_info.source
+    )
+    frame_received = asyncio.Event()
+    unregister = device.register_callback(lambda *_: frame_received.set())
     try:
-        await bedjet.update()
-    except BLEAK_EXCEPTIONS:
-        return (False, "cannot_connect")
+        await device.start()
+        async with asyncio.timeout(PROBE_TIMEOUT):
+            await frame_received.wait()
+    except TimeoutError:
+        return "cannot_connect"
     except Exception:
-        _LOGGER.exception("Unexpected error")
-        return (False, "unknown")
+        _LOGGER.exception("Unexpected error probing BedJet")
+        return "unknown"
     finally:
-        await bedjet.disconnect()
-    return (True, bedjet.name)
+        unregister()
+        await device.stop()
+    return None
 
 
 class BedjetDeviceConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -58,11 +77,10 @@ class BedjetDeviceConfigFlow(ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
 
-        success, name = await connect_bedjet(discovery_info.device)
-        if not success:
-            return self.async_abort(reason=name)
+        if reason := await _async_probe(discovery_info):
+            return self.async_abort(reason=reason)
 
-        name = human_readable_name(name, discovery_info.name, discovery_info.address)
+        name = human_readable_name(None, discovery_info.name, discovery_info.address)
         self.context["title_placeholders"] = {"name": name}
         self._discovery_info = discovery_info
 
@@ -73,6 +91,7 @@ class BedjetDeviceConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Confirm discovery."""
         if user_input is not None:
+            assert self._discovery_info is not None
             return self.async_create_entry(
                 title=self.context["title_placeholders"]["name"],
                 data={CONF_ADDRESS: self._discovery_info.address},
@@ -87,24 +106,24 @@ class BedjetDeviceConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the user step to pick discovered device."""
+        """Handle the user step to pick a discovered device."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
             address = user_input[CONF_ADDRESS]
             discovery_info = self._discovered_devices[address]
-            # local_name = discovery_info.name
-            await self.async_set_unique_id(
-                discovery_info.address, raise_on_progress=False
-            )
+            await self.async_set_unique_id(address, raise_on_progress=False)
             self._abort_if_unique_id_configured()
-            success, name = await connect_bedjet(discovery_info.device)
-            if success:
-                return self.async_create_entry(
-                    title=name,
-                    data={CONF_ADDRESS: discovery_info.address},
+
+            if reason := await _async_probe(discovery_info):
+                errors["base"] = reason
+            else:
+                name = human_readable_name(
+                    None, discovery_info.name, discovery_info.address
                 )
-            errors["base"] = name
+                return self.async_create_entry(
+                    title=name, data={CONF_ADDRESS: address}
+                )
 
         if discovery := self._discovery_info:
             self._discovered_devices[discovery.address] = discovery
@@ -114,10 +133,7 @@ class BedjetDeviceConfigFlow(ConfigFlow, domain=DOMAIN):
                 if (
                     discovery.address in current_addresses
                     or discovery.address in self._discovered_devices
-                    or not (
-                        BEDJET3_SERVICE_UUID in discovery.service_uuids
-                        or (discovery.name and discovery.name.startswith(LOCAL_NAME))
-                    )
+                    or not _is_bedjet(discovery)
                 ):
                     continue
                 self._discovered_devices[discovery.address] = discovery

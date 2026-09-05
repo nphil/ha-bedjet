@@ -1,7 +1,5 @@
 {
   "name": "BedJet",
-  "homeassistant": "2024.5.0",
-  "render_readme": true,
-  "zip_release": true,
-  "filename": "bedjet.zip"
+  "homeassistant": "2026.1.0",
+  "render_readme": true
 }

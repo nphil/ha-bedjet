@@ -8,7 +8,29 @@
         }
       }
     },
+    "button": {
+      "acknowledge_notification": {
+        "default": "mdi:bell-check"
+      },
+      "firmware_update": {
+        "default": "mdi:restart-alert"
+      },
+      "sync_clock": {
+        "default": "mdi:clock-check"
+      }
+    },
+    "sensor": {
+      "scanner": {
+        "default": "mdi:bluetooth"
+      }
+    },
     "switch": {
+      "bluetooth_connection": {
+        "default": "mdi:bluetooth-off",
+        "state": {
+          "on": "mdi:bluetooth-connect"
+        }
+      },
       "enable_led": {
         "default": "mdi:led-off",
         "state": {

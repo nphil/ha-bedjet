@@ -23,7 +23,7 @@ class BedJetNotification(Enum):
     that would be too long running from the current time"""
 
 
-class OperatingMode(IntEnum):
+class BedJetMode(IntEnum):
     """Operating mode."""
 
     STANDBY = 0  # off
@@ -69,21 +69,15 @@ class BedJetCommand(IntEnum):
 
     BUTTON = 0x1
     SET_RUNTIME = 0x2
-    SET_TEMPERATURE = 0x3
-    SET_STEP = 0x4
-    SET_HACKS = 0x5
+    SET_TEMP = 0x3
     STATUS = 0x6
     SET_FAN = 0x7
     SET_CLOCK = 0x8
 
-    SET_BIO = 0x40
     GET_BIO = 0x41
 
 
 class BioDataRequest(IntEnum):
     """BedJet bio data request."""
 
-    DEVICE_NAME = 0
     MEMORY_NAMES = 1
-    BIORHYTHM_NAMES = 4
-    FIRMWARE_VERSIONS = 32

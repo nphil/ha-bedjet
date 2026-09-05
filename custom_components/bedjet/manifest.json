@@ -16,23 +16,18 @@
       "connectable": true
     }
   ],
-  "codeowners": [
-    "@natekspencer",
-    "@jdaleo23"
-  ],
+  "codeowners": ["@nphil"],
   "config_flow": true,
-  "dependencies": [
-    "bluetooth_adapters"
-  ],
-  "documentation": "https://github.com/natekspencer/ha-bedjet",
+  "dependencies": ["bluetooth_adapters"],
+  "documentation": "https://github.com/nphil/ha-bedjet",
   "integration_type": "device",
-  "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/natekspencer/ha-bedjet/issues",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/nphil/ha-bedjet/issues",
   "loggers": [
     "custom_components.bedjet",
     "bleak_retry_connector",
     "bluetooth_adapters",
     "habluetooth"
   ],
-  "version": "0.0.0"
+  "version": "1.0.0"
 }

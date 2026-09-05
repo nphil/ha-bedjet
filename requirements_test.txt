@@ -1,0 +1,11 @@
+# Test-only dependencies. pybedjet imports bleak / bleak-retry-connector at
+# module level (BLE connection handling), and config_flow.py imports
+# bluetooth-data-tools directly; everything Home Assistant provides at
+# runtime is stubbed in tests/ha_stubs.py instead of installed, so the suite
+# runs fast without a Home Assistant checkout. Async command/coordinator
+# tests use asyncio.run() directly rather than pytest-asyncio.
+pytest>=8.0
+bleak>=0.21
+bleak-retry-connector>=3.5
+bluetooth-data-tools>=1.19
+voluptuous>=0.14
