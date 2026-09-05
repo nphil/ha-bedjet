@@ -87,7 +87,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
     coordinator = BedJetCoordinator(hass, entry, device)
     entry.runtime_data = coordinator
 
-    # Kicks off the hold_connection maintain-and-reconnect loop; does not
+    # Kicks off the maintain-and-reconnect loop; does not
     # wait for a connection to actually succeed.
     await device.start()
 

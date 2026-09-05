@@ -19,7 +19,6 @@ ADDRESS = "FC:F5:C4:20:1A:92"
 class FakeDevice:
     def __init__(self) -> None:
         self.address = ADDRESS
-        self.hold_connection = True
         self.acknowledge_calls = 0
         self.sync_clock_calls = 0
         self.firmware_update_calls = 0

@@ -17,7 +17,7 @@ Instead of disabling the whole integration to free the device for the app (the o
 
 ### Bluetooth proxy slot economics
 
-If your BedJet is only reachable through an ESPHome Bluetooth proxy, remember that a proxy also multiplexes a limited number of GATT connection slots across every device it serves. A held BedJet connection consumes one of those slots for as long as `hold_connection` is on, same as it would with a local adapter. This integration only ever holds zero or one connection to the BedJet itself; it does not open extra connections for probing or diagnostics.
+If your BedJet is only reachable through an ESPHome Bluetooth proxy, remember that a proxy also multiplexes a limited number of GATT connection slots across every device it serves. A held BedJet connection consumes one of those slots for as long as the integration is loaded, same as it would with a local adapter. This integration only ever holds zero or one connection to the BedJet itself; it does not open extra connections for probing or diagnostics.
 
 ## How it works
 
@@ -54,7 +54,6 @@ All unique IDs are of the form `<mac-address>_<key>` (the climate entity's uniqu
 | Sensor | `ambient_temperature` | — | ✅ | °C |
 | Sensor | `outlet_temperature` | — | ✅ | °C, the air temperature at the unit's outlet |
 | Sensor | `notification` | — | ✅ | Enum: filter/firmware/biorhythm notifications the unit is reporting |
-| Switch | `bluetooth_connection` | — | ✅ | Always available; turn off to hand the connection slot to the BedJet app |
 | Button | `acknowledge_notification` | — | ✅ | Clears the current notification on the device |
 | Switch | `enable_led` | Config | ❌ | Unit's status LED |
 | Switch | `mute_beeps` | Config | ❌ | Unit's beeper |
@@ -69,7 +68,7 @@ All unique IDs are of the form `<mac-address>_<key>` (the climate entity's uniqu
 | Sensor | `update_phase` | Diagnostic | ❌ | Raw firmware update phase code |
 | Sensor | `scanner` | Diagnostic | ❌ | Which Bluetooth adapter/proxy currently sees this device |
 
-Every entity above the connection switch goes unavailable when the device is disconnected or `bluetooth_connection` is off; there is nothing to report while the connection is intentionally given away.
+Every entity goes unavailable when the device is disconnected. The BedJet accepts one BLE connection at a time and stops advertising while connected, so to use the BedJet mobile app, disable the device (or the integration entry) in Home Assistant first; re-enable it afterwards and the connection is re-established from the next advertisement.
 
 ## Diagnostics
 

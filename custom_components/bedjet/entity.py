@@ -21,10 +21,9 @@ MODEL = "BedJet 3"
 class BedJetEntity(CoordinatorEntity[BedJetCoordinator]):
     """Representation of a BedJet device.
 
-    Unavailable whenever the coordinator has no fresh data or the connection
-    slot has been intentionally handed to another client (``hold_connection``
-    is False). The Bluetooth Connection switch entity overrides ``available``
-    since it must keep working precisely when this is False.
+    Unavailable whenever the coordinator has no fresh data. To hand the
+    BedJet's single BLE connection slot to the mobile app, disable the device
+    or the config entry in Home Assistant - unloading stops the client.
     """
 
     _attr_has_entity_name = True
@@ -44,7 +43,7 @@ class BedJetEntity(CoordinatorEntity[BedJetCoordinator]):
     @property
     def available(self) -> bool:
         """Return True while the device is usable by this entity."""
-        return self.coordinator.available and self._device.hold_connection
+        return self.coordinator.available
 
     @callback
     def _async_update_attrs(self) -> None:

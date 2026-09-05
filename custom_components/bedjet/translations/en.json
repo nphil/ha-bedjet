@@ -85,9 +85,6 @@
       }
     },
     "switch": {
-      "bluetooth_connection": {
-        "name": "Bluetooth connection"
-      },
       "enable_led": {
         "name": "Enable LED"
       },

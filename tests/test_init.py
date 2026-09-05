@@ -127,7 +127,7 @@ def test_setup_does_not_block_or_fail_when_device_never_answers(
 ) -> None:
     """The slot may already be held by the phone app at HA startup; setup
     must still succeed and load entities (which then report unavailable),
-    since that is precisely when the bluetooth_connection switch is needed.
+    so the user can see the device and the failure instead of a setup error.
     """
     service_info = SimpleNamespace(device=object(), advertisement=object(), source="D4:D4:DA:9D:40:8A")
     monkeypatch.setattr(

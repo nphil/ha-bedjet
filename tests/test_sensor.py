@@ -16,7 +16,6 @@ ADDRESS = "FC:F5:C4:20:1A:92"
 class FakeDevice:
     def __init__(self) -> None:
         self.address = ADDRESS
-        self.hold_connection = True
         self.scanner_source = "D4:D4:DA:9D:40:8A"
         self.state = SimpleNamespace(
             ambient_temp_c=24.5,

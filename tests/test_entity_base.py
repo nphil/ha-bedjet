@@ -2,7 +2,7 @@
 
 Uses fakes for the coordinator/device surface entity.py actually touches
 (coordinator.available, coordinator.device, device.address,
-device.hold_connection) so this stays independent of the pybedjet layer.
+so this stays independent of the pybedjet layer.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 class FakeDevice:
     def __init__(self, address: str = "FC:F5:C4:20:1A:92") -> None:
         self.address = address
-        self.hold_connection = True
 
 
 class FakeCoordinator:
@@ -39,15 +38,11 @@ def make_entity() -> tuple[BedJetEntity, FakeCoordinator, FakeDevice]:
     return entity, coordinator, device
 
 
-def test_available_requires_coordinator_available_and_hold_connection() -> None:
+def test_available_follows_coordinator_available() -> None:
     entity, coordinator, device = make_entity()
     assert entity.available is True
 
     coordinator.available = False
-    assert entity.available is False
-
-    coordinator.available = True
-    device.hold_connection = False
     assert entity.available is False
 
 

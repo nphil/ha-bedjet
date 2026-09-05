@@ -37,7 +37,6 @@ async def async_get_config_entry_diagnostics(
         "connection": {
             "connected": device.connected,
             "available": device.available,
-            "hold_connection": device.hold_connection,
             "scanner_source": device.scanner_source,
             "last_frame_at": last_frame_at,
             "seconds_since_last_frame": (

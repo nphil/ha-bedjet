@@ -20,7 +20,6 @@ from homeassistant.exceptions import HomeAssistantError
 class FakeDevice:
     def __init__(self) -> None:
         self.address = "FC:F5:C4:20:1A:92"
-        self.hold_connection = True
 
 
 class FakeCoordinator:

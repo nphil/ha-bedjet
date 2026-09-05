@@ -44,7 +44,6 @@ def make_state(**overrides):
 class FakeDevice:
     def __init__(self) -> None:
         self.address = ADDRESS
-        self.hold_connection = True
         self.mode_calls: list[BedJetMode] = []
         self.fan_calls: list[int] = []
         self.temp_calls: list[float] = []

@@ -14,7 +14,6 @@ ADDRESS = "FC:F5:C4:20:1A:92"
 class FakeDevice:
     def __init__(self) -> None:
         self.address = ADDRESS
-        self.hold_connection = True
         self.mode_calls: list[BedJetMode] = []
         self.fan_calls: list[int] = []
 

@@ -25,12 +25,6 @@
       }
     },
     "switch": {
-      "bluetooth_connection": {
-        "default": "mdi:bluetooth-off",
-        "state": {
-          "on": "mdi:bluetooth-connect"
-        }
-      },
       "enable_led": {
         "default": "mdi:led-off",
         "state": {
