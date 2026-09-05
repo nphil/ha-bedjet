@@ -271,3 +271,39 @@ isn't in one of those two groups (V2 support, `.name`/`.model`/
 `.led_enabled`-as-a-device-property/`.beeps_muted`-as-a-device-property/etc.,
 `SET_STEP`/`SET_HACKS`/`SET_BIO`, `limiter.py`, `helpers.py`) was removed, not
 aliased.
+
+## Post-review hardening: two bugs found by deliberately breaking the test harness
+
+While building the fake-BLE-client smoke tests, two real gaps in `__init__.py`
+surfaced (not test bugs) and were fixed directly, then re-verified along with
+the full existing test suite (no regressions):
+
+1. **`_connect_supervisor`'s own failure handler could itself raise and kill
+   the loop.** A broken `ble_device` (no `.address`) made the `except
+   Exception as err:` block's own logging call (`self.address`) raise a
+   *second* exception from inside the handler, which escaped the `try` and
+   ended the `while` loop for good - "Never raises - must run for the
+   lifetime of the client" was violated. A real `BLEDevice` always has
+   `.address`, so this specific trigger cannot happen in production, but the
+   invariant is load-bearing (there is no other path back to a connection)
+   and cheap to make airtight regardless of the exact trigger: added an outer
+   `try/except Exception` around the entire loop body that logs generically
+   (without touching anything that could itself raise) and sleeps briefly
+   before continuing. Verified with a fake device whose `.address` raises:
+   the supervisor kept retrying (`_reconnect_attempt` climbing) instead of
+   dying after the first iteration.
+2. **The watchdog's PROBE tier blocked itself.** `request_status()` is a
+   fully-confirmed command (awaits a matching frame, 5s timeout) - correct
+   for the public API, but calling it *from the watchdog* meant every PROBE
+   tick blocked the watchdog loop for up to `COMMAND_TIMEOUT_S` waiting for a
+   frame that, by definition, is not arriving (that is why it is probing).
+   The watchdog does not need to observe the probe's own outcome - if it
+   wakes the device, the ordinary notify path updates `last_frame_at` on its
+   own regardless. Added `_write_raw_command` (best-effort
+   `write_gatt_char`, no confirmation future, no predicate) and pointed the
+   watchdog's PROBE branch at it instead of the public method; `CMD_STATUS`
+   is still written with the same bytes. `request_status()` itself is
+   unchanged and stays fully confirmed. Verified by measuring wall-clock
+   time from crossing into UNAVAILABLE territory to `available` actually
+   flipping False: sub-second with the fix (would have needed 5+ real
+   seconds if the probe still blocked).
