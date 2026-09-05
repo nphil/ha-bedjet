@@ -294,11 +294,12 @@ def install() -> bool:
         TURN_ON = 256
 
     class ClimateEntity(_WriteStateRecorder):
-        _attr_hvac_mode = None
+        # Mirror homeassistant.components.climate.ClimateEntity exactly: only the
+        # temperature attrs default to None; hvac_mode/fan_mode/preset_mode are
+        # declared without defaults, so reading them before the entity assigns
+        # them raises AttributeError (the live failure this suite must catch).
         _attr_current_temperature = None
         _attr_target_temperature = None
-        _attr_fan_mode = None
-        _attr_preset_mode = None
 
         @property
         def hvac_mode(self):

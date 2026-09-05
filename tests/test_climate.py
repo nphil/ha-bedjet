@@ -116,6 +116,23 @@ class TestStaticLimits:
         assert entity.fan_modes[-1] == "100%"
         assert len(entity.fan_modes) == 20
 
+class TestBeforeFirstFrame:
+    def test_state_properties_resolve_with_no_coordinator_data(self) -> None:
+        """A listener fan-out before the first decoded frame must not raise.
+
+        Live failure: HA computed the climate state while coordinator.data was
+        None and ClimateEntity's hvac_mode/fan_mode/preset_mode backing
+        attributes had never been assigned (AttributeError in the listener).
+        """
+        coordinator = FakeCoordinator(FakeDevice())
+        coordinator.data = None
+        entity = BedJetClimateEntity(coordinator, "Bedjetty")
+
+        assert entity.hvac_mode is None
+        assert entity.fan_mode is None
+        assert entity.preset_mode is None
+
+
 
 class TestModeMapping:
     @pytest.mark.parametrize(

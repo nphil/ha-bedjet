@@ -79,6 +79,12 @@ class BedJetClimateEntity(BedJetEntity, ClimateEntity):
 
     _attr_fan_modes = [f"{speed}%" for speed in range(5, 101, 5)]
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.DRY]
+    # ClimateEntity declares these without defaults; a listener fan-out before
+    # the first decoded frame (coordinator.data is None) otherwise makes HA's
+    # state calculation raise AttributeError and log an error per entity.
+    _attr_fan_mode: str | None = None
+    _attr_hvac_mode: HVACMode | None = None
+    _attr_preset_mode: str | None = None
     _attr_max_temp = MAX_TEMP_C
     _attr_min_temp = MIN_TEMP_C
     _attr_name = None
