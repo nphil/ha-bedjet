@@ -20,6 +20,9 @@
       }
     },
     "sensor": {
+      "connection": {
+        "default": "mdi:bluetooth-connect"
+      },
       "scanner": {
         "default": "mdi:bluetooth"
       }

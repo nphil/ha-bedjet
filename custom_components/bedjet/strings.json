@@ -57,6 +57,9 @@
       "bio_sequence_step": {
         "name": "Bio sequence step"
       },
+      "connection": {
+        "name": "Connection"
+      },
       "notification": {
         "name": "Notification",
         "state": {

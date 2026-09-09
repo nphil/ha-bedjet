@@ -490,3 +490,115 @@ class TestWatchdog:
             assert bedjet._connect_wakeup.is_set()
 
         asyncio.run(scenario())
+
+
+class TestDropAccounting:
+    """`drops_1h`/`last_drop`/`reconnect_attempt` are what the HA Connection
+    sensor publishes, and habluetooth tracks none of them (it scores connect
+    *failures*, never post-connect drops), so this is the only source.
+    Deliberate releases must not be counted: a user handing the slot to the
+    phone app is not a fault.
+    """
+
+    def test_unexpected_disconnect_is_counted(self, factory, clock, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            assert bedjet.drops_1h == 0
+            assert bedjet.last_drop is None
+
+            factory.last.simulate_disconnect()
+            await _pump()
+
+            assert bedjet.drops_1h == 1
+            assert bedjet.last_drop is not None
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_drops_age_out_of_the_trailing_hour(self, factory, clock, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            factory.last.simulate_disconnect()
+            await _pump()
+            assert bedjet.drops_1h == 1
+
+            clock.advance(pb.DROP_WINDOW_S + 1.0)
+
+            assert bedjet.drops_1h == 0
+            # But the timestamp of the last one is still reportable.
+            assert bedjet.last_drop is not None
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_releasing_the_slot_on_purpose_is_not_a_drop(self, factory, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+
+            bedjet.hold_connection = False
+            await _pump()
+            assert bedjet.connected is False
+
+            await bedjet.stop()
+            assert bedjet.drops_1h == 0
+            assert bedjet.last_drop is None
+
+        asyncio.run(scenario())
+
+    def test_watchdog_forced_reconnect_is_counted(self, factory, clock, monkeypatch) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump(20)
+            clock.advance(pb.WATCHDOG_RECONNECT_AFTER_S + 1.0)
+
+            async def fake_sleep(_seconds: float) -> None:
+                bedjet._stopped = True
+
+            monkeypatch.setattr(pb.asyncio, "sleep", fake_sleep)
+            await bedjet._watchdog_loop()
+
+            # A wedged link that stopped streaming is a lost hold, and it
+            # must be counted exactly once despite the bleak disconnect
+            # callback that follows our own teardown.
+            assert bedjet.drops_1h == 1
+
+        asyncio.run(scenario())
+
+    def test_reconnect_attempt_is_zero_while_connected(self, factory, fast_backoff) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            assert bedjet.connected is True
+            assert bedjet.reconnect_attempt == 0
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_failed_attempts_publish_so_the_sensor_can_follow(
+        self, factory, monkeypatch
+    ) -> None:
+        async def scenario() -> None:
+            monkeypatch.setattr(pb, "reconnect_backoff_seconds", lambda attempt, rng=None: 0.0)
+            FakeBleakClient.fail_next_connects = 12
+            bedjet = make_bedjet(hold_connection=True)
+            events: list[int] = []
+            bedjet.register_callback(lambda device: events.append(device.reconnect_attempt))
+
+            await bedjet.start()
+            for _ in range(50):
+                await asyncio.sleep(0.005)
+                if len(events) >= 2:
+                    break
+
+            assert events[:2] == [1, 2]
+            await bedjet.stop()
+
+        asyncio.run(scenario())

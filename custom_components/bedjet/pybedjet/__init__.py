@@ -29,9 +29,10 @@ module does nothing special here and needs nothing special.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
 import contextlib
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum, auto
 import logging
 import random
@@ -68,6 +69,7 @@ __all__ = [
     "WatchdogAction",
     "watchdog_action",
     "reconnect_backoff_seconds",
+    "DropTracker",
     "is_meaningful_change",
     "decode_frame",
     "merge_tail",
@@ -87,9 +89,12 @@ BIODATA_FULL_UUID = "00002006-bed0-0080-aa55-4265644a6574"  # GET_BIO response r
 # as dead surface. Only ...2006 (BIODATA_FULL) is actually used, for GET_BIO
 # responses.
 
-# Clock hook so tests can control elapsed-time math deterministically without
-# real sleeps; production code always uses the real time.monotonic default.
+# Clock hooks so tests can control elapsed-time math deterministically
+# without real sleeps; production code always uses the real defaults.
+# `_monotonic` drives every elapsed-seconds decision; `_utcnow` only stamps
+# the wall-clock time of a drop for the HA layer to display.
 _monotonic: Callable[[], float] = time.monotonic
+_utcnow: Callable[[], datetime] = lambda: datetime.now(UTC)
 
 # Command confirmation timeout (Contract: "each awaits confirming frame with
 # timeout 5s").
@@ -104,9 +109,20 @@ STATUS_TIMEOUT_S = 300.0
 WATCHDOG_RECONNECT_AFTER_S = 900.0
 WATCHDOG_TICK_S = 10.0
 
-# Reconnect backoff (full jitter).
-RECONNECT_BACKOFF_MIN_S = 2.0
-RECONNECT_BACKOFF_MAX_S = 120.0
+# Reconnect backoff: the fixed 1/2/5/10/30/60s schedule, capped at 60s and
+# spread by +-20% jitter so several devices reconnecting after the same proxy
+# reboot do not retry in lockstep. A held GATT link is the point of this
+# integration, so the schedule never gives up - it just stops growing.
+RECONNECT_BACKOFF_SCHEDULE_S = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+RECONNECT_BACKOFF_JITTER = 0.2
+
+# Log one WARNING per this many consecutive connect failures: a proxy that
+# genuinely cannot reach the unit would otherwise fill the log at the tail of
+# the backoff schedule (once a minute, forever).
+RECONNECT_WARN_EVERY = 10
+
+# Trailing window for the drop counter the HA layer publishes as `drops_1h`.
+DROP_WINDOW_S = 3600.0
 
 # Tail re-read staleness threshold - ESPHome's own MIN_NOTIFY_THROTTLE
 # (bedjet_hub.h:147).
@@ -173,16 +189,58 @@ def watchdog_action(elapsed_s: float) -> WatchdogAction:
 
 
 def reconnect_backoff_seconds(attempt: int, rng: random.Random | None = None) -> float:
-    """Pure full-jitter exponential backoff.
+    """Pure jittered backoff over the fixed `RECONNECT_BACKOFF_SCHEDULE_S`.
 
-    `attempt` is a 0-indexed consecutive-failure count. Returns a value
-    uniformly distributed between `RECONNECT_BACKOFF_MIN_S` and
-    `min(RECONNECT_BACKOFF_MAX_S, RECONNECT_BACKOFF_MIN_S * 2**attempt)`.
-    Pass a seeded `Random` for deterministic tests.
+    `attempt` is a 0-indexed consecutive-failure count; it indexes the
+    schedule and saturates at its last entry (60s), so the supervisor keeps
+    retrying at ~1/minute forever rather than backing off into uselessness.
+    The returned delay is the scheduled value scaled by
+    `1 +- RECONNECT_BACKOFF_JITTER`. Pass a seeded `Random` for deterministic
+    tests.
     """
     rng = rng or random.Random()
-    ceiling = min(RECONNECT_BACKOFF_MAX_S, RECONNECT_BACKOFF_MIN_S * (2**attempt))
-    return rng.uniform(RECONNECT_BACKOFF_MIN_S, ceiling)
+    index = min(max(attempt, 0), len(RECONNECT_BACKOFF_SCHEDULE_S) - 1)
+    base = RECONNECT_BACKOFF_SCHEDULE_S[index]
+    return base * rng.uniform(1.0 - RECONNECT_BACKOFF_JITTER, 1.0 + RECONNECT_BACKOFF_JITTER)
+
+
+class DropTracker:
+    """Trailing-window counter of *unexpected* link drops.
+
+    Pure state plus arithmetic - no I/O, no clock of its own: callers pass
+    the monotonic timestamp used for windowing and the wall-clock instant
+    used for display, so a test can drive it with a fake clock. Only drops
+    the integration did not ask for are recorded (see `_handle_disconnect`
+    and the watchdog's RECONNECT tier); an intentional release
+    (`stop()`/`hold_connection = False`) is not a drop.
+    """
+
+    def __init__(self, window_s: float = DROP_WINDOW_S) -> None:
+        """Init an empty tracker over a trailing `window_s` window."""
+        self._window_s = window_s
+        self._times: deque[float] = deque()
+        self._last_drop: datetime | None = None
+
+    def record(self, at: float, when: datetime) -> None:
+        """Record one drop stamped `at` (monotonic) / `when` (wall clock)."""
+        self._times.append(at)
+        self._last_drop = when
+
+    def count(self, now: float) -> int:
+        """Return drops inside the trailing window, pruning older entries."""
+        cutoff = now - self._window_s
+        while self._times and self._times[0] < cutoff:
+            self._times.popleft()
+        return len(self._times)
+
+    @property
+    def last_drop(self) -> datetime | None:
+        """Wall-clock instant of the most recent drop, or None if never dropped.
+
+        Deliberately not pruned by the window: "when did this link last
+        break" stays useful long after the drop leaves the 1h count.
+        """
+        return self._last_drop
 
 
 def _any_frame(_state: BedJetState) -> bool:
@@ -259,6 +317,7 @@ class BedJet:
         self._stopped = True
         self._reconnect_attempt = 0
         self._connect_wakeup = asyncio.Event()
+        self._drops = DropTracker()
 
         self._connect_task: asyncio.Task[None] | None = None
         self._watchdog_task: asyncio.Task[None] | None = None
@@ -297,6 +356,26 @@ class BedJet:
             and self._last_frame_at is not None
             and (_monotonic() - self._last_frame_at) < STATUS_TIMEOUT_S
         )
+
+    @property
+    def reconnect_attempt(self) -> int:
+        """Consecutive failed connect attempts, or 0 whenever connected.
+
+        This is the index the supervisor is currently backing off at, so a
+        value of 0 while disconnected means "about to try" and a rising
+        value means "still failing".
+        """
+        return 0 if self.connected else self._reconnect_attempt
+
+    @property
+    def drops_1h(self) -> int:
+        """Unexpected disconnects within the trailing `DROP_WINDOW_S`."""
+        return self._drops.count(_monotonic())
+
+    @property
+    def last_drop(self) -> datetime | None:
+        """UTC instant of the most recent unexpected disconnect, or None."""
+        return self._drops.last_drop
 
     @property
     def last_frame_at(self) -> float | None:
@@ -577,13 +656,25 @@ class BedJet:
                 except Exception as err:  # noqa: BLE001 - the supervisor must never die
                     self._reconnect_attempt += 1
                     delay = reconnect_backoff_seconds(self._reconnect_attempt - 1)
-                    _LOGGER.debug(
+                    # One WARNING per RECONNECT_WARN_EVERY consecutive
+                    # failures: enough to notice a link that never comes
+                    # back, quiet enough to live with forever.
+                    log = (
+                        _LOGGER.warning
+                        if self._reconnect_attempt % RECONNECT_WARN_EVERY == 0
+                        else _LOGGER.debug
+                    )
+                    log(
                         "%s: connect attempt %d failed (%s); retrying in %.1fs",
                         self.address,
                         self._reconnect_attempt,
                         err,
                         delay,
                     )
+                    # Publish so the Connection sensor's reconnect_attempt
+                    # attribute tracks the live backoff instead of freezing
+                    # at the value it had when the link dropped.
+                    self._fire_callbacks()
                     await self._wait_for_wakeup(timeout=delay)
                 else:
                     self._reconnect_attempt = 0
@@ -596,7 +687,7 @@ class BedJet:
             except Exception:
                 _LOGGER.exception("unexpected error in BedJet connect supervisor")
                 with contextlib.suppress(Exception):
-                    await asyncio.sleep(RECONNECT_BACKOFF_MIN_S)
+                    await asyncio.sleep(RECONNECT_BACKOFF_SCHEDULE_S[0])
 
     async def _wait_for_wakeup(self, timeout: float | None = None) -> None:
         self._connect_wakeup.clear()
@@ -635,11 +726,29 @@ class BedJet:
 
         self._start_bio_read()
 
+    def _record_drop(self) -> None:
+        """Count one unexpected loss of the held link and log it at INFO."""
+        self._drops.record(_monotonic(), _utcnow())
+        _LOGGER.info(
+            "%s: link dropped (%d in the last hour); reconnecting",
+            self.address,
+            self._drops.count(_monotonic()),
+        )
+
     def _handle_disconnect(self, _client: BleakClientWithServiceCache) -> None:
-        """bleak's disconnected_callback - always sync, may fire for any disconnect reason."""
+        """bleak's disconnected_callback - always sync, may fire for any disconnect reason.
+
+        Reaching here always means the link went away without this library
+        asking for it (an intentional release goes through `_disconnect`,
+        which clears `_client` first and so returns early below), which is
+        exactly the definition of a drop for `drops_1h`/`last_drop`.
+        habluetooth itself does not count post-connect drops anywhere - it
+        only scores *connect* failures - so this is the only place the
+        information exists.
+        """
         if self._client is None:
             return  # already torn down via our own _disconnect()
-        _LOGGER.debug("%s: disconnected", self.address)
+        self._record_drop()
         self._client = None
         self._last_tail_read_at = None
         if self._tail_read_task is not None:
@@ -758,7 +867,13 @@ class BedJet:
                         _LOGGER.warning("%s: no frame for %.0fs, marking unavailable", self.address, elapsed)
                         self._fire_callbacks()
                 elif action is WatchdogAction.RECONNECT:
+                    # A wedged link that stopped streaming is a lost hold as
+                    # far as anyone downstream is concerned, so it counts as
+                    # a drop even though bleak never reported a disconnect
+                    # (this `_disconnect` clears `_client` first, so the
+                    # bleak callback that follows will not double-count).
                     _LOGGER.warning("%s: no frame for %.0fs, forcing reconnect", self.address, elapsed)
+                    self._record_drop()
                     await self._disconnect()
                     self._connect_wakeup.set()
             except asyncio.CancelledError:

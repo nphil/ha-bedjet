@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from habluetooth import get_manager
+
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -97,6 +99,19 @@ SENSORS = (
     ),
 )
 
+# The one sensor an automation is expected to read while the link is *down*,
+# so it is diagnostic but enabled by default (and always available - see
+# `BedJetConnectionSensorEntity.available`). It carries no `value_fn`: its
+# state comes from habluetooth's live slot allocations, not from a frame.
+CONNECTION_SENSOR = SensorEntityDescription(
+    key="connection",
+    entity_category=EntityCategory.DIAGNOSTIC,
+    translation_key="connection",
+)
+
+#: State reported whenever no scanner is holding a GATT link to this device.
+STATE_DISCONNECTED = "disconnected"
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -106,8 +121,13 @@ async def async_setup_entry(
     """Set up the sensor platform for BedJet."""
     coordinator = entry.runtime_data
     async_add_entities(
-        BedJetSensorEntity(coordinator, entry.title, descriptor)
-        for descriptor in SENSORS
+        [
+            *(
+                BedJetSensorEntity(coordinator, entry.title, descriptor)
+                for descriptor in SENSORS
+            ),
+            BedJetConnectionSensorEntity(coordinator, entry.title),
+        ]
     )
 
 
@@ -128,3 +148,68 @@ class BedJetSensorEntity(BedJetEntity, SensorEntity):
         if self.entity_description.key != "scanner" and self.coordinator.data is None:
             return
         self._attr_native_value = self.entity_description.value_fn(self._device)
+
+
+class BedJetConnectionSensorEntity(BedJetEntity, SensorEntity):
+    """Which Bluetooth proxy currently carries this BedJet's held GATT link.
+
+    Exists so a heal automation can tell *which* proxy to restart - and, just
+    as importantly, can leave alone a proxy that other devices are holding.
+    The state is the scanner's display name while a link is held, or the
+    literal "disconnected"; the attributes carry the hold/drop bookkeeping
+    the library tracks (habluetooth counts connect failures but never
+    post-connect drops, so `drops_1h` has no other source).
+    """
+
+    entity_description = CONNECTION_SENSOR
+
+    def __init__(self, coordinator, name: str) -> None:
+        """Initialize the connection sensor."""
+        self._attr_unique_id = f"{coordinator.device.address}_connection"
+        super().__init__(coordinator, name)
+
+    @property
+    def available(self) -> bool:
+        """Always True: reporting "disconnected" is this sensor's whole job."""
+        return True
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to habluetooth's connection-slot allocation changes.
+
+        Allocations change on connect and disconnect without any status frame
+        being involved, so the coordinator's frame pushes alone would leave
+        this sensor stale (and a dropped link produces no frames at all).
+        """
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            get_manager().async_register_allocation_callback(
+                self._async_allocations_changed, None
+            )
+        )
+
+    @callback
+    def _async_allocations_changed(self, _allocations) -> None:
+        """Re-read the authoritative allocation set and republish.
+
+        The callback payload is only the one scanner that changed; the
+        coordinator re-reads every scanner's allocations, which is both
+        cheaper to reason about and correct when a link moves between
+        proxies (one scanner frees a slot as another claims it).
+        """
+        self._async_update_attrs()
+        self.async_write_ha_state()
+
+    @callback
+    def _async_update_attrs(self) -> None:
+        """Handle updating _attr values."""
+        device = self._device
+        self._attr_native_value = (
+            self.coordinator.connection_scanner_name or STATE_DISCONNECTED
+        )
+        last_drop = device.last_drop
+        self._attr_extra_state_attributes = {
+            "hold": device.hold_connection,
+            "drops_1h": device.drops_1h,
+            "last_drop": last_drop.isoformat() if last_drop is not None else None,
+            "reconnect_attempt": device.reconnect_attempt,
+        }

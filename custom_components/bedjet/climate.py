@@ -109,7 +109,22 @@ class BedJetClimateEntity(BedJetEntity, ClimateEntity):
         self._memory_preset_buttons: dict[str, BedJetButton] = dict(
             zip(MEMORY_PRESET_DEFAULT_LABELS, MEMORY_PRESET_BUTTONS, strict=True)
         )
+        # Setpoint requested while the unit was in standby, not yet written
+        # to the device - see `async_set_temperature`.
+        self._deferred_target_c: float | None = None
         super().__init__(coordinator, name)
+
+    @property
+    def _in_standby(self) -> bool:
+        """True when the last frame showed the unit parked in STANDBY.
+
+        WAIT (a biorhythm program between steps) is deliberately excluded:
+        the only mode a setpoint write is *known* to be swallowed in is
+        STANDBY, verified live, and guessing about WAIT would trade a 5s
+        stall for a silently dropped command.
+        """
+        state = self.coordinator.data
+        return state is not None and state.mode is BedJetMode.STANDBY
 
     @callback
     def _async_update_attrs(self) -> None:
@@ -121,6 +136,19 @@ class BedJetClimateEntity(BedJetEntity, ClimateEntity):
         self._attr_fan_mode = f"{state.fan_percent}%"
         self._attr_hvac_mode = MODE_TO_HVAC_MODE.get(state.mode, HVACMode.OFF)
         self._attr_preset_mode = MODE_TO_PRESET.get(state.mode, PRESET_NONE)
+
+        if self._deferred_target_c is not None:
+            if state.mode is BedJetMode.STANDBY:
+                # Still in standby, so the device is still streaming its old
+                # target: keep showing what the user asked for instead of
+                # snapping the thermostat card back.
+                self._attr_target_temperature = self._deferred_target_c
+            else:
+                # The unit left standby without going through this entity
+                # (phone app, the fan entity, a memory preset, a biorhythm
+                # program): the device's own target is authoritative now, so
+                # drop the deferred value rather than fighting it.
+                self._deferred_target_c = None
 
         device = self._device
         labels = [
@@ -138,39 +166,98 @@ class BedJetClimateEntity(BedJetEntity, ClimateEntity):
         ]
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        """Set new target fan mode."""
+        """Set new target fan mode.
+
+        Not deferred in standby, unlike the setpoint: nothing in the ESPHome
+        protocol map, this fork's codec notes, or the live captures says the
+        unit ignores SET_FAN while in standby, so it is sent as always and
+        confirmed against the next frame.
+        """
         await self._async_send_command(
             self._device.set_fan_percent, int(fan_mode.removesuffix("%"))
         )
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set new target hvac mode."""
+        """Set new target hvac mode.
+
+        Also reached by `async_turn_on`, whose ClimateEntity implementation
+        picks the first supported mode and calls this - so turning the unit
+        on applies a deferred setpoint too.
+        """
         if (mode := HVAC_MODE_TO_MODE.get(hvac_mode)) is None:
             raise HomeAssistantError(f"Unsupported HVAC mode: {hvac_mode}")
-        await self._async_send_command(self._device.set_mode, mode)
+        await self._async_send_mode(mode)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set new preset mode."""
         if preset_mode == PRESET_NONE:
             state = self.coordinator.data
             if state is not None and state.mode in PRESET_REVERT_MODES:
-                await self._async_send_command(self._device.set_mode, BedJetMode.HEAT)
+                await self._async_send_mode(BedJetMode.HEAT)
             return
         if (mode := PRESET_TO_MODE.get(preset_mode)) is not None:
-            await self._async_send_command(self._device.set_mode, mode)
+            await self._async_send_mode(mode)
             return
         if (button := self._memory_preset_buttons.get(preset_mode)) is not None:
             await self._async_send_command(self._device.press_button, button)
+            # A memory preset restores its own stored target, fan speed and
+            # runtime; a setpoint deferred while off must not override the
+            # preset the user just asked for.
+            self._deferred_target_c = None
             return
         raise HomeAssistantError(f"{preset_mode} is not a valid preset for {self.name}")
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature."""
+        """Set new target temperature, deferring the write while in standby.
+
+        A BedJet in standby silently ignores SET_TEMP (verified live: the
+        confirming frame never arrives and the command burns the full
+        COMMAND_TIMEOUT_S before failing). HomeKit writes TargetTemperature
+        as its own service call regardless of mode, so from the Home app
+        that was a routine 5s spinner ending in an error and a snap-back.
+        Instead the value is held locally, shown immediately, and written
+        the moment this entity takes the unit out of standby.
+        """
         if ATTR_HVAC_MODE in kwargs:
             _LOGGER.warning(
                 "Changing HVAC mode while setting temperature for %s is not "
                 "supported. Please call `climate.set_hvac_mode` first",
                 self.entity_id,
             )
-        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is not None:
-            await self._async_send_command(self._device.set_temperature_c, temperature)
+        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
+            return
+        if self._in_standby:
+            self._deferred_target_c = temperature
+            self._attr_target_temperature = temperature
+            self.async_write_ha_state()
+            _LOGGER.debug(
+                "%s: deferring target %.1fC until the unit leaves standby",
+                self.entity_id,
+                temperature,
+            )
+            return
+        await self._async_send_command(self._device.set_temperature_c, temperature)
+
+    async def _async_send_mode(self, mode: BedJetMode) -> None:
+        """Send a mode change, then any setpoint deferred while in standby.
+
+        Order matters twice over. On the wire: the setpoint write is only
+        accepted once the unit is out of standby, and `set_mode` does not
+        return until a frame confirms the new mode, so by the time the second
+        command goes out the device is genuinely ready for it. In this
+        process: the deferred value has to be read *before* awaiting, because
+        pybedjet resolves a command's future and fans the confirming frame
+        out to `_async_update_attrs` synchronously inside its notify handler
+        - and that frame, no longer showing STANDBY, clears
+        `_deferred_target_c` before this coroutine is resumed. Reading it
+        afterwards would silently drop every deferred setpoint.
+
+        Left untouched if `set_mode` raises: the unit never left standby, so
+        the value stays pending and displayed.
+        """
+        temperature = self._deferred_target_c
+        await self._async_send_command(self._device.set_mode, mode)
+        if mode is BedJetMode.STANDBY or temperature is None:
+            return
+        self._deferred_target_c = None
+        await self._async_send_command(self._device.set_temperature_c, temperature)

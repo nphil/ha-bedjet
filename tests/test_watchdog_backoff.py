@@ -1,24 +1,26 @@
-"""Tests for the pure watchdog-tier and reconnect-backoff decision functions.
+"""Tests for the pure watchdog-tier, reconnect-backoff and drop-window logic.
 
-Both are plain functions of elapsed-seconds / attempt-count so the 60s/300s/
-900s watchdog tiers and the 2s..120s backoff growth are provable without any
-real-time sleeping.
+All three are plain functions of elapsed-seconds / attempt-count / timestamps
+so the 60s/300s/900s watchdog tiers, the 1-2-5-10-30-60s reconnect schedule
+and the trailing-hour drop count are provable without any real-time sleeping.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import random
 
 import pytest
 
 from custom_components.bedjet.pybedjet import (
+    DropTracker,
     WatchdogAction,
     reconnect_backoff_seconds,
     watchdog_action,
 )
 
-RECONNECT_BACKOFF_MIN_S = 2.0
-RECONNECT_BACKOFF_MAX_S = 120.0
+SCHEDULE = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+JITTER = 0.2
 
 
 class TestWatchdogAction:
@@ -40,35 +42,69 @@ class TestWatchdogAction:
 
 
 class TestReconnectBackoffSeconds:
-    def test_attempt_zero_is_within_min_and_double_min(self) -> None:
+    @pytest.mark.parametrize(("attempt", "base"), list(enumerate(SCHEDULE)))
+    def test_each_attempt_stays_within_jitter_of_its_scheduled_delay(
+        self, attempt: int, base: float
+    ) -> None:
         rng = random.Random(1234)
-        value = reconnect_backoff_seconds(0, rng)
-        assert RECONNECT_BACKOFF_MIN_S <= value <= RECONNECT_BACKOFF_MIN_S * 2
+        samples = [reconnect_backoff_seconds(attempt, rng) for _ in range(200)]
+        assert min(samples) >= base * (1 - JITTER)
+        assert max(samples) <= base * (1 + JITTER)
 
-    def test_grows_with_attempt_before_capping(self) -> None:
-        # Full-jitter range widens monotonically until the cap: sample many
-        # draws per attempt and compare maxima, which is robust to jitter.
-        rng = random.Random(99)
-        attempt1_samples = [reconnect_backoff_seconds(1, rng) for _ in range(200)]
-        attempt3_samples = [reconnect_backoff_seconds(3, rng) for _ in range(200)]
-        assert max(attempt3_samples) > max(attempt1_samples)
-        assert min(attempt1_samples) >= RECONNECT_BACKOFF_MIN_S
-        assert min(attempt3_samples) >= RECONNECT_BACKOFF_MIN_S
-
-    def test_caps_at_max_for_large_attempt_counts(self) -> None:
+    @pytest.mark.parametrize("attempt", [len(SCHEDULE), 20, 10_000])
+    def test_saturates_at_the_last_scheduled_delay_and_never_gives_up(
+        self, attempt: int
+    ) -> None:
+        # The hold is meant to be permanent: past the end of the schedule the
+        # supervisor keeps retrying at ~60s forever rather than growing the
+        # delay without bound.
         rng = random.Random(7)
-        samples = [reconnect_backoff_seconds(20, rng) for _ in range(200)]
-        assert max(samples) <= RECONNECT_BACKOFF_MAX_S
-        assert min(samples) >= RECONNECT_BACKOFF_MIN_S
-        # With the range fully saturated at the cap, samples should spread
-        # across most of [MIN, MAX], not cluster near MIN as an uncapped
-        # exponential would.
-        assert max(samples) > RECONNECT_BACKOFF_MAX_S * 0.5
+        samples = [reconnect_backoff_seconds(attempt, rng) for _ in range(100)]
+        assert min(samples) >= SCHEDULE[-1] * (1 - JITTER)
+        assert max(samples) <= SCHEDULE[-1] * (1 + JITTER)
+
+    def test_jitter_actually_spreads_retries(self) -> None:
+        # Several devices reconnecting after one proxy reboot must not retry
+        # in lockstep, so the delay may not be a constant.
+        rng = random.Random(3)
+        samples = [reconnect_backoff_seconds(2, rng) for _ in range(200)]
+        assert max(samples) - min(samples) > SCHEDULE[2] * JITTER
 
     def test_deterministic_with_seeded_random(self) -> None:
-        expected = random.Random(42).uniform(
-            RECONNECT_BACKOFF_MIN_S,
-            min(RECONNECT_BACKOFF_MAX_S, RECONNECT_BACKOFF_MIN_S * 2**2),
-        )
+        expected = SCHEDULE[2] * random.Random(42).uniform(1 - JITTER, 1 + JITTER)
         actual = reconnect_backoff_seconds(2, random.Random(42))
         assert actual == pytest.approx(expected)
+
+
+class TestDropTracker:
+    def test_counts_only_drops_inside_the_trailing_window(self) -> None:
+        tracker = DropTracker(window_s=3600.0)
+        when = datetime(2026, 9, 8, 3, 0, tzinfo=UTC)
+        tracker.record(1_000.0, when)
+        tracker.record(2_000.0, when)
+
+        assert tracker.count(2_000.0) == 2
+        # 1_000.0 has aged out of the hour, 2_000.0 has not.
+        assert tracker.count(4_700.0) == 1
+        assert tracker.count(5_700.0) == 0
+
+    def test_last_drop_survives_the_window_it_aged_out_of(self) -> None:
+        tracker = DropTracker(window_s=60.0)
+        when = datetime(2026, 9, 8, 3, 0, tzinfo=UTC)
+        tracker.record(100.0, when)
+
+        assert tracker.count(10_000.0) == 0
+        assert tracker.last_drop == when
+
+    def test_no_drops_yet_reports_zero_and_none(self) -> None:
+        tracker = DropTracker()
+        assert tracker.count(12_345.0) == 0
+        assert tracker.last_drop is None
+
+    def test_last_drop_is_the_most_recent_one(self) -> None:
+        tracker = DropTracker()
+        first = datetime(2026, 9, 8, 3, 0, tzinfo=UTC)
+        second = datetime(2026, 9, 8, 3, 30, tzinfo=UTC)
+        tracker.record(100.0, first)
+        tracker.record(200.0, second)
+        assert tracker.last_drop == second

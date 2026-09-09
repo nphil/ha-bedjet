@@ -38,6 +38,12 @@ async def async_get_config_entry_diagnostics(
             "connected": device.connected,
             "available": device.available,
             "scanner_source": device.scanner_source,
+            "hold": device.hold_connection,
+            "drops_1h": device.drops_1h,
+            "last_drop": (
+                device.last_drop.isoformat() if device.last_drop is not None else None
+            ),
+            "reconnect_attempt": device.reconnect_attempt,
             "last_frame_at": last_frame_at,
             "seconds_since_last_frame": (
                 round(now - last_frame_at, 1) if last_frame_at is not None else None

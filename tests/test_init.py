@@ -38,6 +38,9 @@ class FakeBedJet:
         self.callbacks: list = []
         self.set_ble_calls: list[tuple] = []
         self.state = SimpleNamespace(sentinel=True)
+        self.address = ADDRESS
+        self.connected = False
+        self.scanner_source = source
         FakeBedJet.instances.append(self)
 
     def register_callback(self, callback):

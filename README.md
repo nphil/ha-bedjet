@@ -24,6 +24,8 @@ If your BedJet is only reachable through an ESPHome Bluetooth proxy, remember th
 - No polling: the BedJet notify characteristic streams a status frame at roughly 4 Hz whenever a connection is held - even while the unit is in standby - so every entity updates the moment a real frame arrives instead of on a timer.
 - Commands (mode, temperature, fan speed, runtime, LED, mute) are confirmed against the next status frame that reflects them, with a 5 second timeout. There is no optimistic/local echo: if the timeout expires, the service call fails with a clear error instead of silently pretending the change happened.
 - The integration listens passively to Home Assistant's Bluetooth scanner (including proxies) for advertisements from this device's address. An advertisement means the device is currently free (nothing is connected to it), which is what lets the library reconnect automatically after the app - or anything else - lets go.
+- Setting a temperature while the unit is off is **deferred, not sent**: a BedJet in standby silently ignores a setpoint write, so the command used to sit for the full 5 second confirmation window and then fail (which is exactly what the Apple Home app does every time it writes a target temperature). The requested value is shown right away and written the moment you turn the unit on from this entity; if something else starts the unit first, the device's own target wins and the deferred value is dropped.
+- The `connection` sensor names the Bluetooth adapter or proxy currently carrying the held GATT link (or `disconnected`), pushed from Home Assistant's live connection-slot allocations. Its attributes add `hold`, `drops_1h`, `last_drop` and `reconnect_attempt`, so a "restart the proxy" automation can tell which proxy to restart - and can leave alone a proxy other devices are using.
 
 ## ⬇️ Installation
 
@@ -67,8 +69,9 @@ All unique IDs are of the form `<mac-address>_<key>` (the climate entity's uniqu
 | Sensor | `turbo_time` | Diagnostic | ❌ | Seconds of Turbo boost remaining |
 | Sensor | `update_phase` | Diagnostic | ❌ | Raw firmware update phase code |
 | Sensor | `scanner` | Diagnostic | ❌ | Which Bluetooth adapter/proxy currently sees this device |
+| Sensor | `connection` | Diagnostic | ✅ | Name of the adapter/proxy holding the GATT link, or `disconnected`; attributes `hold`, `drops_1h`, `last_drop`, `reconnect_attempt` |
 
-Every entity goes unavailable when the device is disconnected. The BedJet accepts one BLE connection at a time and stops advertising while connected, so to use the BedJet mobile app, disable the device (or the integration entry) in Home Assistant first; re-enable it afterwards and the connection is re-established from the next advertisement.
+Every entity except `connection` goes unavailable when the device is disconnected (`connection` stays available - reporting `disconnected` is its job). The BedJet accepts one BLE connection at a time and stops advertising while connected, so to use the BedJet mobile app, disable the device (or the integration entry) in Home Assistant first; re-enable it afterwards and the connection is re-established from the next advertisement.
 
 ## Diagnostics
 

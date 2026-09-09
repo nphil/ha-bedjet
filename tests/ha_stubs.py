@@ -49,6 +49,11 @@ class _WriteStateRecorder:
     coordinator push must reach ``async_write_ha_state`` with no polling).
     """
 
+    #: Real HA's ``Entity`` declares this as a class attribute that stays
+    #: unset until the entity is added to a platform; log lines that mention
+    #: ``self.entity_id`` must not explode in a test.
+    entity_id: str | None = None
+
     @property
     def write_ha_state_calls(self) -> int:
         return getattr(self, "_write_ha_state_calls", 0)
@@ -255,6 +260,9 @@ def install() -> bool:
     def async_register_callback(hass, callback_fn, matcher, mode):
         return lambda: None
 
+    def async_scanner_by_source(hass, source):
+        return None
+
     bluetooth.BluetoothScanningMode = BluetoothScanningMode
     bluetooth.BluetoothChange = BluetoothChange
     bluetooth.BluetoothServiceInfoBleak = BluetoothServiceInfoBleak
@@ -262,6 +270,28 @@ def install() -> bool:
     bluetooth.async_ble_device_from_address = async_ble_device_from_address
     bluetooth.async_last_service_info = async_last_service_info
     bluetooth.async_register_callback = async_register_callback
+    bluetooth.async_scanner_by_source = async_scanner_by_source
+
+    # -- habluetooth ---------------------------------------------------------
+    # habluetooth ships inside Home Assistant, not in this fork's test deps.
+    # The integration imports exactly one symbol from it (`get_manager`, for
+    # live connection-slot allocations); a test that exercises allocation
+    # lookups monkeypatches `get_manager` in the module under test, so the
+    # stub only has to exist and to fail loudly if something forgets to.
+    habluetooth = _module("habluetooth")
+
+    @dataclasses.dataclass(frozen=True)
+    class HaBluetoothSlotAllocations:
+        source: str
+        slots: int
+        free: int
+        allocated: list[str]
+
+    def get_manager():
+        raise RuntimeError("habluetooth manager is not set (test stub)")
+
+    habluetooth.HaBluetoothSlotAllocations = HaBluetoothSlotAllocations
+    habluetooth.get_manager = get_manager
 
     bluetooth_match = _module("homeassistant.components.bluetooth.match")
     bluetooth.match = bluetooth_match
@@ -617,6 +647,7 @@ def install() -> bool:
         def __init__(self, coordinator: DataUpdateCoordinator, context: Any = None) -> None:
             self.coordinator = coordinator
             self.coordinator_context = context
+            self._on_remove: list[Callable[[], None]] = []
             self._remove_listener = coordinator.async_add_listener(
                 self._handle_coordinator_update, context
             )
@@ -630,6 +661,21 @@ def install() -> bool:
 
         async def async_update(self) -> None:
             pass
+
+        async def async_added_to_hass(self) -> None:
+            """Real HA subscribes to the coordinator here; the stub did it in __init__."""
+
+        async def async_will_remove_from_hass(self) -> None:
+            """Called before an entity is removed, exactly like real HA."""
+
+        def async_on_remove(self, func: Callable[[], None]) -> None:
+            self._on_remove.append(func)
+
+        async def async_remove(self, *, force_remove: bool = False) -> None:
+            """Mirror real HA's removal order: will_remove, then on_remove LIFO."""
+            await self.async_will_remove_from_hass()
+            while self._on_remove:
+                self._on_remove.pop()()
 
         @callback
         def _handle_coordinator_update(self) -> None:

@@ -2,7 +2,16 @@
 
 Covers: static 19-43C limits regardless of the per-mode min/max a status
 frame reports (upstream issue #61 churn), fan_modes 5%..100%, hvac/preset
-mapping, and command-error -> HomeAssistantError mapping.
+mapping, command-error -> HomeAssistantError mapping, and the
+deferred-setpoint state machine for a unit in standby.
+
+`FakeDevice` mirrors one non-obvious pybedjet property: a command does not
+return until a frame confirms it, and that frame is decoded and fanned out
+to entities *synchronously* from inside the notify handler - so an entity's
+`_async_update_attrs` has already run against the new state by the time the
+awaiting service call resumes. Deferred-setpoint bookkeeping is only correct
+if it survives that, so the fake reproduces the ordering rather than
+returning silently.
 """
 
 from __future__ import annotations
@@ -21,8 +30,9 @@ from custom_components.bedjet.climate import (
     BedJetClimateEntity,
 )
 from custom_components.bedjet.pybedjet import BedJetCommandError
-from custom_components.bedjet.pybedjet.const import BedJetMode
+from custom_components.bedjet.pybedjet.const import BedJetButton, BedJetMode
 from homeassistant.components.climate import HVACMode
+from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.exceptions import HomeAssistantError
 
 ADDRESS = "FC:F5:C4:20:1A:92"
@@ -49,26 +59,38 @@ class FakeDevice:
         self.temp_calls: list[float] = []
         self.button_calls: list = []
         self.raise_on_command: Exception | None = None
+        self.coordinator: FakeCoordinator | None = None
+
+    def _confirm(self, **changes) -> None:
+        """Publish the frame that confirms the command just written."""
+        coordinator = self.coordinator
+        if coordinator is None or coordinator.data is None:
+            return
+        coordinator.push(make_state(**{**vars(coordinator.data), **changes}))
 
     async def set_mode(self, mode) -> None:
         if self.raise_on_command:
             raise self.raise_on_command
         self.mode_calls.append(mode)
+        self._confirm(mode=mode)
 
     async def set_fan_percent(self, percent: int) -> None:
         if self.raise_on_command:
             raise self.raise_on_command
         self.fan_calls.append(percent)
+        self._confirm(fan_percent=percent)
 
     async def set_temperature_c(self, celsius: float) -> None:
         if self.raise_on_command:
             raise self.raise_on_command
         self.temp_calls.append(celsius)
+        self._confirm(target_temp_c=celsius)
 
     async def press_button(self, button) -> None:
         if self.raise_on_command:
             raise self.raise_on_command
         self.button_calls.append(button)
+        self._confirm()
 
 
 class FakeCoordinator:
@@ -76,9 +98,18 @@ class FakeCoordinator:
         self.device = device
         self.available = True
         self.data = make_state()
+        self._listeners: list = []
+        device.coordinator = self
 
     def async_add_listener(self, update_callback, context=None):
-        return lambda: None
+        self._listeners.append(update_callback)
+        return lambda: self._listeners.remove(update_callback)
+
+    def push(self, state) -> None:
+        """Fan a decoded frame out to entities like the real coordinator."""
+        self.data = state
+        for update_callback in list(self._listeners):
+            update_callback()
 
 
 def make_entity(device: FakeDevice | None = None) -> tuple[BedJetClimateEntity, FakeCoordinator]:
@@ -218,12 +249,13 @@ class TestServiceCalls:
         asyncio.run(entity.async_set_fan_mode("55%"))
         assert device.fan_calls == [55]
 
-    def test_set_temperature_forwards_celsius(self) -> None:
-        from homeassistant.const import ATTR_TEMPERATURE
-
+    def test_set_temperature_while_running_writes_immediately(self) -> None:
         device = FakeDevice()
-        entity, _coordinator = make_entity(device)
+        entity, coordinator = make_entity(device)
+        coordinator.push(make_state(mode=BedJetMode.HEAT))
+
         asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
         assert device.temp_calls == [38.0]
 
     def test_command_failure_surfaces_as_home_assistant_error(self) -> None:
@@ -232,3 +264,128 @@ class TestServiceCalls:
         entity, _coordinator = make_entity(device)
         with pytest.raises(HomeAssistantError):
             asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT))
+
+
+class TestDeferredSetpointInStandby:
+    """The unit silently ignores SET_TEMP while in standby (verified live:
+    the confirming frame never arrives and the command burns the full 5s
+    COMMAND_TIMEOUT_S). HomeKit writes TargetTemperature unconditionally, so
+    the value is held locally and written when the unit leaves standby.
+    """
+
+    def test_set_while_off_does_not_write_but_shows_immediately(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+        writes_before = entity.write_ha_state_calls
+
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        assert device.temp_calls == []  # nothing hit the wire: no 5s stall
+        assert entity.target_temperature == 38.0
+        assert entity.write_ha_state_calls > writes_before
+
+    def test_deferred_value_survives_frames_that_still_report_standby(self) -> None:
+        device = FakeDevice()
+        entity, coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        # The device keeps streaming its own (unchanged) target at ~4Hz.
+        coordinator.push(make_state(mode=BedJetMode.STANDBY, target_temp_c=40.0))
+
+        assert entity.target_temperature == 38.0
+
+    def test_turning_on_sends_the_mode_then_the_deferred_setpoint(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT))
+
+        assert device.mode_calls == [BedJetMode.HEAT]
+        assert device.temp_calls == [38.0]
+        assert entity.target_temperature == 38.0
+
+    def test_deferred_setpoint_is_applied_once_not_on_every_later_mode_change(
+        self,
+    ) -> None:
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT))
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.COOL))
+
+        assert device.temp_calls == [38.0]
+
+    def test_turning_off_does_not_write_the_deferred_setpoint(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.OFF))
+
+        assert device.mode_calls == [BedJetMode.STANDBY]
+        assert device.temp_calls == []
+        assert entity.target_temperature == 38.0  # still pending, still shown
+
+    def test_failed_mode_change_keeps_the_value_pending(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+        device.raise_on_command = BedJetCommandError("confirmation timed out")
+
+        with pytest.raises(HomeAssistantError):
+            asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT))
+
+        device.raise_on_command = None
+        assert entity.target_temperature == 38.0
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT))
+        assert device.temp_calls == [38.0]
+
+    def test_external_mode_change_drops_the_deferred_value(self) -> None:
+        device = FakeDevice()
+        entity, coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        # Somebody else (phone app, the fan entity, a biorhythm program)
+        # started the unit: the device's own target is authoritative now.
+        coordinator.push(make_state(mode=BedJetMode.COOL, target_temp_c=40.0))
+
+        assert entity.target_temperature == 40.0
+        # And it must not resurface the next time this entity changes mode.
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT))
+        assert device.temp_calls == []
+
+    def test_memory_preset_keeps_its_own_stored_target(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        asyncio.run(entity.async_set_preset_mode("M1"))
+
+        # The preset restores its own target/fan/runtime; overriding it with
+        # a setpoint the user typed while the unit was off would fight it.
+        assert device.button_calls == [BedJetButton.M1]
+        assert device.temp_calls == []
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT))
+        assert device.temp_calls == []
+
+    def test_heat_preset_applies_the_deferred_setpoint(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+        asyncio.run(entity.async_set_temperature(**{ATTR_TEMPERATURE: 38.0}))
+
+        asyncio.run(entity.async_set_preset_mode(PRESET_TURBO))
+
+        assert device.mode_calls == [BedJetMode.TURBO]
+        assert device.temp_calls == [38.0]
+
+    def test_fan_speed_is_not_deferred_in_standby(self) -> None:
+        # No ground truth says SET_FAN is ignored in standby, so it is still
+        # sent and confirmed exactly as before.
+        device = FakeDevice()
+        entity, _coordinator = make_entity(device)
+
+        asyncio.run(entity.async_set_fan_mode("55%"))
+
+        assert device.fan_calls == [55]
